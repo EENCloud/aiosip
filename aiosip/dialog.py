@@ -434,7 +434,7 @@ class InviteDialog(DialogBase):
 
     async def wait_for_terminate(self, timeout=10):
         try:
-            while not self._waiter.done():
+            while not (self._waiter.done() and self._queue.empty()):
                 yield await asyncio.wait_for(self._queue.get(), timeout)
         except asyncio.TimeoutError:
             LOG.warning("Timeout during wait a response from the server")
