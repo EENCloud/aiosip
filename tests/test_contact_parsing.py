@@ -59,6 +59,20 @@ def test_header_with_quoted_name_and_space_before_params():
     assert str(header) == '"Bob" <sips:bob@biloxi.com>;tag=a48s'
 
 
+def test_header_with_quoted_empty_name():
+    header = aiosip.Contact.from_header('""<sip:biloxi.com>')
+    assert header['name'] == ''
+    assert dict(header['params']) == {}
+    assert dict(header['uri']) == {'scheme': 'sip',
+                                   'user': None,
+                                   'password': None,
+                                   'host': 'biloxi.com',
+                                   'port': None,
+                                   'params': None,
+                                   'headers': None}
+    assert str(header) == '<sip:biloxi.com>'
+
+
 def test_header_without_brackets():
     # RFC 3261 - 8.1.1.3
     header = aiosip.Contact.from_header('sip:+12125551212@phone2net.com;tag=887s')
