@@ -25,7 +25,7 @@ test_requirements = [
 
 setup(
     name='aiosip',
-    version='0.2.3',
+    version='0.2.4',
     description='SIP support for AsyncIO',
     long_description=readme + '\n\n' + history,
     author='Ludovic Gasc (GMLudo)',
