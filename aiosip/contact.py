@@ -17,7 +17,7 @@ CONTACT_PATTERNS = [
                '[ \t]*'
                '(?:;(?P<params>[^\?]*))?'),
     # quoted name
-    re.compile('^(?:"(?P<name>[^"]+)")'
+    re.compile('^(?:"(?P<name>[^"]*)")'
                '[ \t]*'
                '<(?P<uri>[^>]+)>'
                '[ \t]*'
