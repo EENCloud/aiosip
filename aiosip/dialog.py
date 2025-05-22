@@ -8,7 +8,7 @@ from async_timeout import timeout as Timeout
 
 from . import utils
 from .auth import AuthenticateAuth, AuthorizationAuth
-from .message import Request, Response
+from .message import Request, Response, CompactHeaderResponse
 from .transaction import UnreliableTransaction
 
 
@@ -215,13 +215,15 @@ class DialogBase:
         else:
             self.peer.send_message(msg)
 
-    async def reply(self, request, status_code, status_message=None, payload=None, headers=None, contact_details=None):
-        msg = self._prepare_response(request, status_code, status_message, payload, headers, contact_details)
+    async def reply(self, request, status_code, status_message=None, payload=None, headers=None, contact_details=None, compact=None):
+        msg = self._prepare_response(request, status_code, status_message, payload, headers, contact_details, compact)
         self.peer.send_message(msg)
 
     def _prepare_response(self, request, status_code, status_message=None, payload=None, headers=None,
-                          contact_details=None):
+                          contact_details=None, compact=None):
 
+        if compact is None:
+            compact = False
         if contact_details:
             self.contact_details = contact_details
 
@@ -233,17 +235,30 @@ class DialogBase:
         headers['Call-ID'] = self.call_id
         headers['Via'] = request.headers['Via']
 
-        msg = Response(
-            status_code=status_code,
-            status_message=status_message,
-            headers=headers,
-            from_details=self.to_details,
-            to_details=self.from_details,
-            contact_details=self.contact_details,
-            payload=payload,
-            cseq=request.cseq,
-            method=request.method
-        )
+        if not compact:
+            msg = Response(
+                status_code=status_code,
+                status_message=status_message,
+                headers=headers,
+                from_details=self.to_details,
+                to_details=self.from_details,
+                contact_details=self.contact_details,
+                payload=payload,
+                cseq=request.cseq,
+                method=request.method
+            )
+        else:
+            msg = CompactHeaderResponse(
+                status_code=status_code,
+                status_message=status_message,
+                headers=headers,
+                from_details=self.to_details,
+                to_details=self.from_details,
+                contact_details=self.contact_details,
+                payload=payload,
+                cseq=request.cseq,
+                method=request.method
+            )
         return msg
 
     def __repr__(self):
