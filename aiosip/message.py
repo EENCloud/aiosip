@@ -18,6 +18,35 @@ FIRST_LINE_PATTERN = {
         'str': 'SIP/2.0 {status_code} {status_message}'},
 }
 
+# Complete official mapping from RFCs and IANA SIP Parameters Registry
+# https://www.iana.org/assignments/sip-parameters/sip-parameters.xhtml
+compact_to_long = {
+    # Core RFC 3261 compact headers
+    'v': 'Via',                    # RFC 3261
+    'f': 'From',                   # RFC 3261
+    't': 'To',                     # RFC 3261
+    'i': 'Call-ID',                # RFC 3261
+    'm': 'Contact',                # RFC 3261
+    'l': 'Content-Length',         # RFC 3261
+    'c': 'Content-Type',           # RFC 3261
+    'e': 'Content-Encoding',       # RFC 3261
+    's': 'Subject',                # RFC 3261
+    'k': 'Supported',              # RFC 3261
+
+    # Extended compact headers from other RFCs
+    'x': 'Session-Expires',        # RFC 4028
+    'r': 'Refer-To',               # RFC 3515
+    'b': 'Referred-By',            # RFC 3892
+    'j': 'Reject-Contact',         # RFC 3841
+    'a': 'Accept-Contact',         # RFC 3841
+    'o': 'Event',                  # RFC 6665
+    'u': 'Allow-Events',           # RFC 3265
+    'd': 'Request-Disposition',    # RFC 3841
+    'y': 'Identity',               # RFC 4474 (deprecated in RFC 8224)
+}
+
+long_to_compact = {value: key for key, value in compact_to_long.items()}
+
 
 LOG = logging.getLogger(__name__)
 
@@ -209,6 +238,8 @@ class Message:
         decoded_headers = raw_headers.decode().split(utils.EOL)
         for line in decoded_headers[1:]:
             k, v = line.split(': ', 1)
+            if k.lower() in compact_to_long:
+                k = compact_to_long[k.lower()]
             if k in headers:
                 o = headers.setdefault(k, [])
                 if not isinstance(o, list):
@@ -385,3 +416,24 @@ class Response(Message):
 
     def encode(self, *args, **kwargs):
         return self._first_line.encode(*args, **kwargs) + utils.BYTES_EOL + super().encode(*args, **kwargs)
+
+class CompactHeaderResponse(Response):
+    def _format_headers(self):
+        msg = []
+        for k, v in sorted(self.headers.items()):
+            if k == 'Via':
+                if k in long_to_compact:
+                    k = long_to_compact[k]
+                if isinstance(v, (list, tuple)):
+                    msg = ['%s: %s' % (k, i) for i in v] + msg
+                else:
+                    msg.insert(0, '%s: %s' % (k, v))
+            else:
+                if k in long_to_compact:
+                    k = long_to_compact[k]
+                if isinstance(v, (list, tuple)):
+                    msg.extend(['%s: %s' % (k, i) for i in v])
+                else:
+                    msg.append('%s: %s' % (k, v))
+        msg.append(utils.EOL)
+        return utils.EOL.join(msg)
