@@ -2,17 +2,28 @@ import enum
 import asyncio
 import logging
 
+from contextlib import suppress
+
 from multidict import CIMultiDict
 from collections import defaultdict
 from async_timeout import timeout as Timeout
 
 from . import utils
-from .auth import AuthenticateAuth, AuthorizationAuth
+from .auth import Auth, AuthenticateAuth, AuthorizationAuth
+from .contact import Contact
 from .message import Request, Response, CompactHeaderResponse
-from .transaction import UnreliableTransaction
+from .transaction import CHALLENGE_HEADER, UnreliableTransaction
 
 
 LOG = logging.getLogger(__name__)
+
+# How long close() waits for the INVITE's final response (normally 487) after
+# a CANCEL has been answered, when the caller gave no timeout of its own.
+CANCEL_FINAL_RESPONSE_TIMEOUT = 5
+
+# How many 2xx ACKs a dialog keeps for retransmission. One per forked callee is
+# enough; the bound stops a long-lived dialog from growing an entry per 2xx.
+MAX_CACHED_ACKS = 16
 
 
 class CallState(enum.Enum):
@@ -49,6 +60,14 @@ class DialogBase:
         self.inbound = inbound
         self.transactions = defaultdict(dict)
         self.auth = None
+        # Keys this dialog is registered under in app._dialogs. dialog_id
+        # changes as tags are learned and Peer._create_dialog adds a tagless
+        # fallback, so the keys are remembered rather than searched for.
+        self._dialog_keys = set()
+        # ACKs sent for a 2xx, keyed by (CSeq, remote tag): a retransmitted 2xx
+        # is answered with the same ACK (RFC 3261 section 13.2.2.4), while a
+        # forked INVITE yields one 2xx per callee, each needing its own.
+        self._acks = {}
 
         # TODO: Needs to be last because we need the above attributes set
         self.original_msg = self._prepare_request(method, headers=headers, payload=payload)
@@ -62,12 +81,30 @@ class DialogBase:
                           self.original_msg.from_details['params']['tag'],
                           self.call_id))
 
+    def _register(self, key=None):
+        """Register this dialog in ``app._dialogs`` under ``key``."""
+        if key is None:
+            key = self.dialog_id
+        self._dialog_keys.add(key)
+        self.app._dialogs[key] = self
+
+    def _unregister(self, key=None):
+        """Remove this dialog from ``app._dialogs``, all its keys by default."""
+        if key is None:
+            keys, self._dialog_keys = self._dialog_keys, set()
+        else:
+            keys = {key}
+            self._dialog_keys.discard(key)
+        for key in keys:
+            if self.app._dialogs.get(key) is self:
+                del self.app._dialogs[key]
+
     def _receive_response(self, msg):
 
-        if 'tag' not in self.to_details['params']:
-            del self.app._dialogs[self.dialog_id]
+        if 'tag' not in self.to_details['params'] and 'tag' in msg.to_details['params']:
+            self._unregister(self.dialog_id)
             self.to_details['params']['tag'] = msg.to_details['params']['tag']
-            self.app._dialogs[self.dialog_id] = self
+            self._register()
 
         try:
             transaction = self.transactions[msg.method][msg.cseq]
@@ -113,12 +150,63 @@ class DialogBase:
         return await self.request(self.original_msg.method, headers=headers, payload=self.original_msg.payload,
                                   timeout=timeout)
 
-    def ack(self, msg, headers=None, *args, **kwargs):
-        headers = CIMultiDict(headers or {})
+    def ack(self, msg, headers=None, *, request=None):
+        """Acknowledge the final response ``msg`` to the INVITE ``request``.
 
-        headers['Via'] = msg.headers['Via']
-        ack = self._prepare_request('ACK', cseq=msg.cseq, to_details=msg.to_details, headers=headers, *args, **kwargs)
+        ``request`` is the INVITE as it was sent; it defaults to the dialog's
+        initial INVITE, which is right for InviteDialog. Transactions pass
+        their own sent request so that re-INVITEs and authenticated retries
+        are acknowledged against the Via that actually went out.
+        """
+        headers = CIMultiDict(headers or {})
+        if request is None:
+            request = self.original_msg
+
+        # A forked INVITE is answered by several 2xx that share a CSeq and
+        # differ only in the To tag, and each needs its own ACK.
+        ack_key = (msg.cseq, msg.to_details['params'].get('tag'))
+        cached = self._acks.get(ack_key)
+        if cached is not None:
+            # Retransmitted 2xx: one client transaction retransmitting its ACK.
+            self.peer.send_message(cached)
+            return
+
+        if msg.status_code >= 300:
+            # RFC 3261 section 17.1.1.3: the ACK for a non-2xx final response is
+            # part of the INVITE transaction and must carry the INVITE's top Via
+            # (same branch). The request's Via is used rather than the
+            # response's so that received/rport added by the peer are not copied.
+            headers['Via'] = request.headers['Via']
+        # else: RFC 3261 section 13.2.2.4 with 8.1.1.7, the ACK for a 2xx is a
+        # new transaction; leaving Via unset lets Request build a fresh one
+        # (current contact host/port, new branch) the same way as any request.
+
+        ack = self._prepare_request('ACK', cseq=msg.cseq, to_details=msg.to_details, headers=headers)
+        if msg.status_code < 300:
+            self._acks[ack_key] = ack
+            while len(self._acks) > MAX_CACHED_ACKS:
+                del self._acks[next(iter(self._acks))]
         self.peer.send_message(ack)
+
+    def _prepare_cancel(self, request, contact_details=None, headers=None, payload=None):
+        """Build the CANCEL for ``request`` (RFC 3261 section 9.1).
+
+        Request-URI, Call-ID, To, From and the CSeq number are those of the
+        request being cancelled and the single Via must match its top Via, so
+        the CANCEL shares the INVITE's branch and CSeq number. Everything the
+        caller may still choose is forwarded to ``_prepare_request``.
+        """
+        headers = CIMultiDict(headers or {})
+        headers['Via'] = request.headers['Via']
+        # The dialog's To object is shared with the sent request and gains the
+        # remote tag from the first response; the To header string was fixed
+        # when the request was encoded, so it is the one to copy.
+        if 'To' in request.headers:
+            to_details = Contact.from_header(request.headers['To'])
+        else:
+            to_details = request.to_details
+        return self._prepare_request('CANCEL', contact_details=contact_details, headers=headers,
+                                     payload=payload, cseq=request.cseq, to_details=to_details)
 
     async def unauthorized(self, msg, realm='sip', algorithm='md5', **kwargs):
         if 'Authorization' not in msg.headers or self.auth is None:
@@ -180,11 +268,9 @@ class DialogBase:
             for transaction in transactions.values():
                 transaction.close()
 
-        # Should not be necessary once dialog are correctly tracked
-        try:
-            del self.app._dialogs[self.dialog_id]
-        except KeyError as e:
-            pass
+        # A dialog is registered under more than one key, so all of them go,
+        # not just the current dialog_id.
+        self._unregister()
 
     def _connection_lost(self):
         for transactions in self.transactions.values():
@@ -299,14 +385,11 @@ class Dialog(DialogBase):
     async def _receive_request(self, msg):
 
         if 'tag' in msg.to_details['params']:
-            try:
-                del self.app._dialogs[
-                    frozenset((self.original_msg.to_details['params'].get('tag'),
-                               None,
-                               self.call_id))
-                ]
-            except KeyError:
-                pass
+            self._unregister(
+                frozenset((self.original_msg.to_details['params'].get('tag'),
+                           None,
+                           self.call_id))
+            )
 
         await self._incoming.put(msg)
         self._maybe_close(msg)
@@ -347,8 +430,54 @@ class Dialog(DialogBase):
 
         return await self.request('NOTIFY', *args, headers=headers, **kwargs)
 
-    def cancel(self, *args, **kwargs):
-        cancel = self._prepare_request('CANCEL', *args, **kwargs)
+    def _pending_invite(self, cseq=None):
+        """Return the sent INVITE that is still awaiting its final response.
+
+        With ``cseq`` the INVITE with that CSeq number is looked up; without it
+        the most recent pending INVITE is returned. None when there is none:
+        cancel() is called from cleanup paths where the transaction may
+        already have completed, so a miss is not an error.
+        """
+        pending = self.transactions.get('INVITE', {})
+        if cseq is not None:
+            transaction = pending.get(cseq)
+            return transaction.original_msg if transaction is not None else None
+        if pending:
+            return pending[max(pending)].original_msg
+        return None
+
+    def cancel(self, contact_details=None, headers=None, payload=None, cseq=None, to_details=None, *,
+               request=None):
+        """Send a CANCEL for ``request``, or for the pending INVITE.
+
+        The argument list mirrors ``_prepare_request`` so that the call means
+        the same thing whichever path it takes. ``cseq`` selects which pending
+        INVITE to cancel; the dialog's initial request is a template that is
+        never sent, so it is not used as a fallback.
+
+        RFC 3261 section 9.1 fixes a CANCEL's To and CSeq to those of the
+        request being cancelled, so ``to_details`` is rejected rather than
+        silently ignored when an INVITE is being cancelled.
+        """
+        if request is None:
+            request = self._pending_invite(cseq)
+
+        if request is not None and request.method == 'INVITE':
+            if to_details is not None:
+                raise TypeError(
+                    'to_details cannot be set when cancelling an INVITE: RFC 3261 section 9.1 '
+                    'requires the CANCEL to carry the To of the request being cancelled'
+                )
+            cancel = self._prepare_cancel(request, contact_details=contact_details, headers=headers,
+                                          payload=payload)
+        else:
+            # RFC 3261 section 9.1 restricts CANCEL to INVITE. For anything
+            # else keep the previous behaviour: a CANCEL of its own, with a
+            # fresh branch, so it is not matched to the live transaction.
+            if request is not None and cseq is None:
+                cseq = request.cseq
+            cancel = self._prepare_request('CANCEL', contact_details=contact_details, headers=headers,
+                                           payload=payload, cseq=cseq, to_details=to_details)
         self.peer.send_message(cancel)
 
     async def recv(self):
@@ -368,46 +497,59 @@ class InviteDialog(DialogBase):
         self._queue = asyncio.Queue()
         self._state = CallState.Calling
         self._waiter = asyncio.Future()
+        self._auth_attempts = 3
 
     async def receive_message(self, msg):  # noqa: C901
         if 'tag' not in self.to_details['params'] and 'tag' in msg.to_details['params']:
-            del self.app._dialogs[self.dialog_id]
+            self._unregister(self.dialog_id)
             self.to_details['params']['tag'] = msg.to_details['params']['tag']
-            self.app._dialogs[self.dialog_id] = self
+            self._register()
 
         async def set_result(msg):
             self.ack(msg)
             if not self._waiter.done():
                 self._waiter.set_result(msg)
 
-        async def handle_calling_state(msg):
-            if 100 <= msg.status_code < 200:
-                self._state = CallState.Proceeding
-
-            elif msg.status_code == 200:
+        async def handle_final_response(msg):
+            # RFC 3261 section 8.1.3.2: an unrecognised 2xx is treated as 200
+            if 200 <= msg.status_code < 300:
                 self._state = CallState.Terminated
                 await set_result(msg)
 
             elif 300 <= msg.status_code < 700:
                 self._state = CallState.Completed
                 await set_result(msg)
+
+        async def handle_calling_state(msg):
+            if 100 <= msg.status_code < 200:
+                self._state = CallState.Proceeding
+            else:
+                await handle_final_response(msg)
 
         async def handle_proceeding_state(msg):
             if 100 <= msg.status_code < 200:
                 pass
+            else:
+                await handle_final_response(msg)
 
-            elif msg.status_code == 200:
-                self._state = CallState.Terminated
-                await set_result(msg)
+        if isinstance(msg, Response):
+            initial_invite_response = msg.method == 'INVITE' and msg.cseq == self.original_msg.cseq
+            if not initial_invite_response:
+                # Response to a request sent inside the dialog (CANCEL, BYE,
+                # re-INVITE, ...): it belongs to that transaction and is not
+                # a call progress message to be passed up.
+                return self._receive_response(msg)
 
-            elif 300 <= msg.status_code < 700:
-                self._state = CallState.Completed
-                await set_result(msg)
+            if self._state in (CallState.Completed, CallState.Terminated):
+                # RFC 3261 sections 17.1.1.3 and 13.2.2.4: a retransmitted final
+                # response (our ACK was lost) is acknowledged again, and is not
+                # passed up a second time.
+                if msg.status_code >= 200:
+                    self.ack(msg)
+                return
 
-        async def handle_completed_state(msg):
-            # Any additional messages in this state MUST be acked but
-            # are NOT to be passed up
-            self.ack(msg)
+            if msg.status_code in (401, 407) and msg.auth and self._retry_with_auth(msg):
+                return
 
         await self._queue.put(msg)
 
@@ -418,14 +560,75 @@ class InviteDialog(DialogBase):
         elif self._state == CallState.Proceeding:
             await handle_proceeding_state(msg)
 
-        elif self._state == CallState.Completed:
-            await handle_completed_state(msg)
-
-        elif self._state == CallState.Terminated:
-            if isinstance(msg, Response) or msg.method == 'ACK':
+        else:
+            # Completed or Terminated: only requests from the peer reach here
+            # (BYE, ...), responses returned above.
+            if msg.method == 'ACK':
                 return self._receive_response(msg)
             else:
                 return await self._receive_request(msg)
+
+    def _retry_with_auth(self, msg):
+        """Re-send the initial INVITE with credentials after a 401/407.
+
+        The initial INVITE is sent outside any transaction (see ``start()``),
+        so ``FutureTransaction._handle_authenticate`` never sees its
+        challenge. Returns True when a retry was sent.
+
+        TODO: running the initial INVITE through an UnreliableTransaction the
+        way ``Dialog.request()`` does would fold this, the CSeq based routing
+        above and the re-ACK special case into the transaction layer.
+        """
+        if self.password is None:
+            return False
+
+        self._auth_attempts -= 1
+        if self._auth_attempts < 1:
+            return False
+
+        # RFC 3261 17.1.1.3: the challenge is a final response and is ACKed
+        # before the request is re-sent as a new transaction.
+        self.ack(msg)
+
+        previous = self.original_msg
+        headers = CIMultiDict(previous.headers)
+        for name in ('Via', 'CSeq', 'Content-Length', 'Authorization', 'Proxy-Authorization'):
+            headers.popall(name, None)
+
+        # Same To as sent: the dialog's Contact may already carry the
+        # challenge's tag (RFC 3261 8.1.3.5).
+        if 'To' in previous.headers:
+            to_details = Contact.from_header(previous.headers['To'])
+        else:
+            to_details = previous.to_details
+
+        retry = self._prepare_request(previous.method, headers=headers, payload=previous.payload,
+                                      to_details=to_details)
+        header = 'Proxy-Authorization' if msg.status_code == 407 else 'Authorization'
+        # A response may carry both challenges; answer the one belonging to the
+        # header the credential goes into.
+        challenge = Auth.from_message(msg, header=CHALLENGE_HEADER[header]) or msg.auth
+        retry.headers[header] = challenge.generate_authorization(
+            username=previous.from_details['uri']['user'],
+            password=self.password,
+            payload=msg.payload,
+            uri=to_details['uri'].short_uri()
+        )
+
+        # Responses are routed by the initial INVITE's CSeq, so the retry
+        # becomes the request this dialog is waiting on. dialog_id is derived
+        # from original_msg's To, so the dialog has to be re-registered under
+        # the new (untagged) key; the tag learned from the challenge does not
+        # carry over, and RFC 3261 8.2.6.2 lets the UAS pick a new one for the
+        # authenticated transaction.
+        self._unregister(self.dialog_id)
+        self.to_details = to_details  # same object as the retry's To
+        self.original_msg = retry
+        self._register()
+
+        self._state = CallState.Calling
+        self.peer.send_message(retry)
+        return True
 
     async def _receive_request(self, msg):
         if 'tag' in msg.from_details['params']:
@@ -456,7 +659,9 @@ class InviteDialog(DialogBase):
 
     async def ready(self):
         msg = await self._waiter
-        if msg.status_code != 200:
+        # RFC 3261 section 8.1.3.2: any 2xx establishes the call, as the state
+        # machine in receive_message() treats it.
+        if not 200 <= msg.status_code < 300:
             raise RuntimeError("INVITE failed with {}".format(msg.status_code))
 
     def end_transaction(self, transaction):
@@ -478,15 +683,30 @@ class InviteDialog(DialogBase):
             if self._state == CallState.Terminated:
                 msg = self._prepare_request('BYE')
             elif self._state != CallState.Completed:
-                msg = self._prepare_request('CANCEL')
+                msg = self._prepare_cancel(self.original_msg)
 
             if msg:
                 transaction = UnreliableTransaction(self, original_msg=msg, loop=self.app.loop)
                 self.transactions[msg.method][msg.cseq] = transaction
 
+                deadline = None if timeout is None else self.app.loop.time() + timeout
                 try:
                     async with Timeout(timeout):
                         await transaction.start()
+
+                    if msg.method == 'CANCEL':
+                        # RFC 3261 section 9.1: the 200 to the CANCEL does not end
+                        # the INVITE transaction. Its final response (normally
+                        # 487) still has to arrive and be ACKed, so the dialog
+                        # stays registered a little longer. Outside the Timeout
+                        # above and with its own bound: the CANCEL itself was
+                        # answered, so a missing 487 must not fail close().
+                        wait = CANCEL_FINAL_RESPONSE_TIMEOUT
+                        if deadline is not None:
+                            # one budget for the whole call, not timeout twice
+                            wait = min(wait, max(0, deadline - self.app.loop.time()))
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(asyncio.shield(self._waiter), timeout=wait)
                 finally:
                     self._close()
 

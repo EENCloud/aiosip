@@ -2,8 +2,18 @@ import asyncio
 import logging
 
 import aiosip
-from aiosip.auth import Auth
+from multidict import CIMultiDict
+
+from .auth import Auth
+from .contact import Contact
 from .exceptions import AuthentificationFailed
+
+
+# Which challenge answers which credential header (RFC 3261 sections 22.2-22.3)
+CHALLENGE_HEADER = {
+    'Authorization': 'WWW-Authenticate',
+    'Proxy-Authorization': 'Proxy-Authenticate',
+}
 
 
 LOG = logging.getLogger(__name__)
@@ -44,13 +54,22 @@ class BaseTransaction:
         if self.retransmission:
             self.retransmission.cancel()
             self.retransmission = None
+        # _handle_authenticate replaces the retransmission timer with this one;
+        # leaving it running would keep re-sending the authenticated request for
+        # ~63s against a dialog the application has already torn down.
+        if self.authentification:
+            self.authentification.cancel()
+            self.authentification = None
 
     async def _timer(self, timeout=0.5):
         max_timeout = timeout * 64
-        while timeout <= max_timeout:
+        while self._running and timeout <= max_timeout:
             self.dialog.peer.send_message(self.original_msg)
             await asyncio.sleep(timeout)
             timeout *= 2
+
+        if not self._running:
+            return
 
         self._error(asyncio.TimeoutError('SIP timer expired for {cseq}, {method}, {call_id}'.format(
             cseq=self.original_msg.cseq,
@@ -58,9 +77,16 @@ class BaseTransaction:
             call_id=self.original_msg.headers['Call-ID']
         )))
 
-    def _handle_authenticate(self, msg):
+    def _handle_authenticate(self, msg, header='Authorization'):
         if self.dialog.password is None:
             raise ValueError('Password required for authentication')
+
+        # A response may carry both challenges; answer the one belonging to the
+        # header the credential goes into.
+        challenge = Auth.from_message(msg, header=CHALLENGE_HEADER[header]) or msg.auth
+        if challenge is None:
+            self._result(msg)
+            return
 
         self.attempts -= 1
         if self.attempts < 1:
@@ -75,31 +101,65 @@ class BaseTransaction:
         else:
             username = msg.from_details['uri']['user']
 
-        self.original_msg.cseq += 1
-        self.original_msg.headers['Authorization'] = msg.auth.generate_authorization(
+        # RFC 3261 sections 8.1.3.5 and 17.1.3: the request re-sent with
+        # credentials is a new transaction. Build it through the dialog so it
+        # gets a fresh CSeq (keeping dialog.cseq in step) and a fresh Via
+        # branch, instead of mutating the request that is already on the wire.
+        previous = self.original_msg
+        headers = CIMultiDict(previous.headers)
+        # Credentials are recomputed for the challenge's nonce; a stale one
+        # copied along would be rejected and the retry would loop.
+        for name in ('Via', 'CSeq', 'Content-Length', 'Authorization', 'Proxy-Authorization'):
+            headers.popall(name, None)
+        # RFC 3261 section 8.1.3.5: same Call-ID, To and From as the previous
+        # request. The dialog's To object has meanwhile been stamped with the
+        # 401's tag, so the To is taken back from the request as it was sent.
+        if 'To' in previous.headers:
+            to_details = Contact.from_header(previous.headers['To'])
+        else:
+            to_details = previous.to_details
+        retry = self.dialog._prepare_request(previous.method, headers=headers, payload=previous.payload,
+                                             to_details=to_details)
+        retry.headers[header] = challenge.generate_authorization(
             username=username,
             password=self.dialog.password,
             payload=msg.payload,
             uri=msg.to_details['uri'].short_uri()
         )
 
-        self.dialog.transactions[self.original_msg.method][self.original_msg.cseq] = self
+        # Re-key the transaction: a retransmitted 401 for the old CSeq must not
+        # find us again and trigger another retry.
+        self.dialog.transactions[previous.method].pop(previous.cseq, None)
+        self.original_msg = retry
+        self.dialog.transactions[retry.method][retry.cseq] = self
+
+        # RFC 3261 8.2.6.2 lets the UAS pick a fresh To tag, but only for a
+        # request that establishes the dialog. When the challenged request went
+        # out untagged, the dialog is registered under the tag learned from the
+        # challenge and its tagless fallback key was dropped when that tag was
+        # learned, so a new tag would match neither: forget the challenge's tag
+        # and re-register so the fallback matches again.
+        #
+        # For an in-dialog request (a BYE, a SUBSCRIBE/REGISTER refresh, a
+        # re-INVITE) the remote tag is fixed for the life of the dialog and is
+        # left alone; dropping it would strand the dialog and send every later
+        # in-dialog request with a tagless To.
+        if 'tag' not in to_details['params']:
+            dialog = self.dialog
+            dialog._unregister(dialog.dialog_id)
+            dialog.to_details['params'].pop('tag', None)
+            dialog._register()
+
         self.authentification = asyncio.ensure_future(self._timer())
 
     def _handle_proxy_authenticate(self, msg):
-        self._handle_proxy_authenticate(msg)
-        self.original_msg = self.original_msg.pop(msg.cseq)
-        del (self.original_msg.headers['CSeq'])
-        self.original_msg.headers['Proxy-Authorization'] = str(Auth.from_authenticate_header(
-            authenticate=msg.headers['Proxy-Authenticate'],
-            method=msg.method,
-            uri=str(self.to_details),
-            username=self.to_details['uri']['user'],
-            password=self.dialog.password))
-        self.dialog.send_message(msg.method,
-                                 headers=self.original_msg.headers,
-                                 payload=self.original_msg.payload,
-                                 future=self.futrue)
+        """Retry with proxy credentials (RFC 3261 section 26.2.4).
+
+        Identical to :meth:`_handle_authenticate` except that the challenge
+        comes from Proxy-Authenticate and the answer goes in
+        Proxy-Authorization; ``msg.auth`` parses either header.
+        """
+        return self._handle_authenticate(msg, header='Proxy-Authorization')
 
     def __repr__(self):
         return '<{0} cseq={1}, method={2}, dialog={3}>'.format(
@@ -121,16 +181,20 @@ class FutureTransaction(BaseTransaction):
         super()._incoming(msg)
         if msg.method == 'ACK':
             self._result(msg)
-        elif msg.status_code == 401 and msg.auth:
+            return
+
+        status_code = msg.status_code
+        if self.original_msg.method.upper() == 'INVITE' and status_code >= 200:
+            # RFC 3261 sections 17.1.1.3 and 13.2.2.4: every final response to an
+            # INVITE is acknowledged, 2xx and non-2xx alike, a 401/407 that is
+            # about to be retried with credentials included.
+            self.dialog.ack(msg, request=self.original_msg)
+
+        if status_code == 401 and msg.auth:
             self._handle_authenticate(msg)
-            return
-        elif msg.status_code == 407:  # Proxy authentication
+        elif status_code == 407 and msg.auth:  # Proxy authentication
             self._handle_proxy_authenticate(msg)
-            return
-        elif self.original_msg.method.upper() == 'INVITE' and msg.status_code == 200:
-            self.dialog.ack(msg)
-            self._result(msg)
-        elif 100 <= msg.status_code < 200:
+        elif 100 <= status_code < 200:
             pass
         else:
             self._result(msg)
@@ -139,14 +203,16 @@ class FutureTransaction(BaseTransaction):
         if self.authentification:
             self.authentification.cancel()
             self.authentification = None
-        self._future.set_exception(error)
+        if not self._future.done():
+            self._future.set_exception(error)
         self.dialog.end_transaction(self)
 
     def _result(self, msg):
         if self.authentification:
             self.authentification.cancel()
             self.authentification = None
-        self._future.set_result(msg)
+        if not self._future.done():  # the awaiting task may have been cancelled
+            self._future.set_result(msg)
         self.dialog.end_transaction(self)
 
     def close(self):
@@ -162,5 +228,5 @@ class UnreliableTransaction(FutureTransaction):
             if type(self.dialog) is aiosip.dialog.InviteDialog:
                 self.loop.run_until_complete(self.dialog.close())
             else:
-                self.dialog.cancel(cseq=self.original_msg.cseq)
+                self.dialog.cancel(request=self.original_msg)
         super().close()

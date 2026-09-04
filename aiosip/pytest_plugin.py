@@ -53,7 +53,8 @@ def setup_test_loop(loop_factory=asyncio.new_event_loop):
     """
     loop = loop_factory()
     asyncio.set_event_loop(loop)
-    if sys.platform != "win32":
+    if sys.platform != "win32" and sys.version_info < (3, 12):
+        # Child watchers are deprecated in 3.12 and removed in 3.14.
         policy = asyncio.get_event_loop_policy()
         watcher = asyncio.SafeChildWatcher()
         watcher.attach_loop(loop)
@@ -86,22 +87,30 @@ def pytest_configure(config):
     if tokio is not None:  # pragma: no cover
         factories['tokio'] = tokio.new_event_loop
 
-    LOOP_FACTORIES.clear()
-    LOOP_FACTORY_IDS.clear()
-
     if loops == 'all':
         loops = 'pyloop,uvloop?,tokio?'
 
+    selected = []
     for name in loops.split(','):
         required = not name.endswith('?')
         name = name.strip(' ?')
         if name in factories:
-            LOOP_FACTORIES.append(factories[name])
-            LOOP_FACTORY_IDS.append(name)
+            selected.append((name, factories[name]))
         elif required:
-            raise ValueError(
+            # A bad --loop value is a user error; ValueError here surfaces as
+            # pytest's INTERNALERROR traceback instead of a usage message.
+            raise pytest.UsageError(
                 "Unknown loop '%s', available loops: %s" % (
                     name, list(factories.keys())))
+
+    if not selected:
+        raise pytest.UsageError(
+            "--loop %r selected no available event loop" % config.getoption('--loop'))
+
+    config._aiosip_loops = selected
+    # Kept in sync for anything still reading the module level lists.
+    LOOP_FACTORY_IDS[:] = [name for name, _ in selected]
+    LOOP_FACTORIES[:] = [factory for _, factory in selected]
     asyncio.set_event_loop(None)
 
 
@@ -124,13 +133,47 @@ def pytest_pyfunc_call(pyfuncitem):
         return True
 
 
-@pytest.fixture(params=LOOP_FACTORIES, ids=LOOP_FACTORY_IDS)
+def pytest_generate_tests(metafunc):
+    """Parametrize the ``loop`` fixture with the loops selected by ``--loop``.
+
+    The selection is only known in pytest_configure, which is too late for a
+    ``params=`` argument on the fixture decorator (evaluated at import time),
+    so the parametrization happens here, at collection time. Tests and
+    downstream conftests that parametrize ``loop`` themselves are left alone.
+
+    NOTE: the override detection reads private pytest surfaces
+    (``metafunc._arg2fixturedefs`` and a FixtureDef's ``func``), and the loop
+    selection is read from ``config._aiosip_loops`` stashed by
+    ``pytest_configure``. Verified against pytest 8.2.2 (CPython 3.9) and
+    pytest 9.0.2 (CPython 3.12); re-check these three when bumping pytest.
+    """
+    if 'loop' not in metafunc.fixturenames:
+        return
+
+    fixturedefs = metafunc._arg2fixturedefs.get('loop')
+    if not fixturedefs or getattr(fixturedefs[-1].func, '__module__', None) != __name__:
+        return  # a downstream conftest provides its own loop fixture
+
+    for marker in metafunc.definition.iter_markers('parametrize'):
+        argnames = marker.args[0] if marker.args else marker.kwargs.get('argnames', '')
+        if isinstance(argnames, str):
+            argnames = [name.strip() for name in argnames.split(',')]
+        if 'loop' in argnames:
+            return
+
+    loops = metafunc.config._aiosip_loops
+    metafunc.parametrize('loop', [factory for _, factory in loops],
+                         ids=[name for name, _ in loops], indirect=True)
+
+
+@pytest.fixture
 def loop(request):
-    """Return an instance of the event loop."""
+    """Return an instance of the event loop selected by ``--loop``."""
+    loop_factory = request.param
     fast = request.config.getoption('--fast')
     debug = request.config.getoption('--enable-loop-debug')
 
-    with loop_context(request.param, fast=fast) as _loop:
+    with loop_context(loop_factory, fast=fast) as _loop:
         if debug:
             _loop.set_debug(True)  # pragma: no cover
         yield _loop

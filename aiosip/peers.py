@@ -79,10 +79,12 @@ class Peer:
         )
 
         LOG.debug('Creating dialog: %s', dialog)
-        self._app._dialogs[dialog.dialog_id] = dialog
-        self._app._dialogs[
+        dialog._register()
+        # Tagless fallback: the first response carries a tag the dialog does
+        # not know yet, so Application._dispatch matches on the From tag alone.
+        dialog._register(
             frozenset((dialog.original_msg.to_details['params'].get('tag'), None, dialog.call_id))
-        ] = dialog
+        )
         return dialog
 
     async def request(self, method, from_details, to_details, contact_details=None, password=None, call_id=None,
@@ -156,9 +158,6 @@ class Peer:
         LOG.debug('Lost connection for %s', self)
         self._protocol = None
         self._disconnected_future.set_result(None)
-
-    def generate_via_headers(self, branch=utils.gen_branch()):
-        return f'SIP/2.0/{self._protocol.via} {self.local_addr[0]}:{self.local_addr[1]};branch={branch}'
 
     @property
     def local_addr(self):
