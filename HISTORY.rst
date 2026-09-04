@@ -19,7 +19,17 @@ History
 * Every final response to an INVITE sent through a transaction (re-INVITE,
   ``peer.request('INVITE')``) is acknowledged, not just a 200.
 * ``peer.invite(password=...)`` now answers a 401/407 challenge; the initial
-  INVITE is sent outside a transaction, so InviteDialog retries it itself.
+  INVITE is sent outside a transaction, so InviteDialog retries it itself,
+  re-registering the dialog so its responses are still routed to it.
+* Proxy authentication works: ``Auth.from_message`` reads Proxy-Authenticate
+  and ``_handle_proxy_authenticate`` answers with Proxy-Authorization instead
+  of recursing into itself. Stale credentials are not copied into a retry.
+* A retransmitted 2xx is answered by retransmitting the same ACK rather than
+  building a new one with a fresh branch.
+* ``close()`` bounds its wait for the 487 after a CANCEL and never raises
+  because that response is missing.
+* Closing a dialog removes every key it is registered under, not just the
+  current ``dialog_id``.
 * ``Dialog.cancel()`` cancels the pending INVITE transaction (``cseq=``
   picks one) instead of the unsent template request, and the authenticated
   retry keeps the To header of the request as it was sent.

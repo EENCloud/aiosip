@@ -17,6 +17,10 @@ from .transaction import UnreliableTransaction
 
 LOG = logging.getLogger(__name__)
 
+# How long close() waits for the INVITE's final response (normally 487) after
+# a CANCEL has been answered, when the caller gave no timeout of its own.
+CANCEL_FINAL_RESPONSE_TIMEOUT = 5
+
 
 class CallState(enum.Enum):
     Calling = enum.auto()
@@ -52,6 +56,9 @@ class DialogBase:
         self.inbound = inbound
         self.transactions = defaultdict(dict)
         self.auth = None
+        # ACKs sent for a 2xx, by CSeq: a retransmitted 2xx is answered with
+        # the same ACK (RFC 3261 section 13.2.2.4), not a new transaction.
+        self._acks = {}
 
         # TODO: Needs to be last because we need the above attributes set
         self.original_msg = self._prepare_request(method, headers=headers, payload=payload)
@@ -128,6 +135,12 @@ class DialogBase:
         if request is None:
             request = self.original_msg
 
+        cached = self._acks.get(msg.cseq)
+        if cached is not None:
+            # Retransmitted 2xx: one client transaction retransmitting its ACK.
+            self.peer.send_message(cached)
+            return
+
         if msg.status_code >= 300:
             # RFC 3261 section 17.1.1.3: the ACK for a non-2xx final response is
             # part of the INVITE transaction and must carry the INVITE's top Via
@@ -139,14 +152,17 @@ class DialogBase:
         # (current contact host/port, new branch) the same way as any request.
 
         ack = self._prepare_request('ACK', cseq=msg.cseq, to_details=msg.to_details, headers=headers)
+        if msg.status_code < 300:
+            self._acks[msg.cseq] = ack
         self.peer.send_message(ack)
 
-    def _prepare_cancel(self, request, headers=None):
+    def _prepare_cancel(self, request, contact_details=None, headers=None, payload=None):
         """Build the CANCEL for ``request`` (RFC 3261 section 9.1).
 
         Request-URI, Call-ID, To, From and the CSeq number are those of the
         request being cancelled and the single Via must match its top Via, so
-        the CANCEL shares the INVITE's branch and CSeq number.
+        the CANCEL shares the INVITE's branch and CSeq number. Everything the
+        caller may still choose is forwarded to ``_prepare_request``.
         """
         headers = CIMultiDict(headers or {})
         headers['Via'] = request.headers['Via']
@@ -157,7 +173,8 @@ class DialogBase:
             to_details = Contact.from_header(request.headers['To'])
         else:
             to_details = request.to_details
-        return self._prepare_request('CANCEL', cseq=request.cseq, to_details=to_details, headers=headers)
+        return self._prepare_request('CANCEL', contact_details=contact_details, headers=headers,
+                                     payload=payload, cseq=request.cseq, to_details=to_details)
 
     async def unauthorized(self, msg, realm='sip', algorithm='md5', **kwargs):
         if 'Authorization' not in msg.headers or self.auth is None:
@@ -219,11 +236,11 @@ class DialogBase:
             for transaction in transactions.values():
                 transaction.close()
 
-        # Should not be necessary once dialog are correctly tracked
-        try:
-            del self.app._dialogs[self.dialog_id]
-        except KeyError as e:
-            pass
+        # A dialog is registered under more than one key (Peer._create_dialog
+        # adds a tagless fallback, and dialog_id changes as tags are learned),
+        # so every key pointing here goes, not just the current dialog_id.
+        for key in [k for k, dialog in self.app._dialogs.items() if dialog is self]:
+            del self.app._dialogs[key]
 
     def _connection_lost(self):
         for transactions in self.transactions.values():
@@ -389,14 +406,15 @@ class Dialog(DialogBase):
     def _pending_invite(self, cseq=None):
         """Return the sent INVITE that is still awaiting its final response.
 
-        With ``cseq`` the INVITE with that CSeq number is required; without it
-        the most recent pending INVITE is returned, None when there is none.
+        With ``cseq`` the INVITE with that CSeq number is looked up; without it
+        the most recent pending INVITE is returned. None when there is none:
+        cancel() is called from cleanup paths where the transaction may
+        already have completed, so a miss is not an error.
         """
         pending = self.transactions.get('INVITE', {})
         if cseq is not None:
-            if cseq not in pending:
-                raise ValueError('No pending INVITE transaction with CSeq {}'.format(cseq))
-            return pending[cseq].original_msg
+            transaction = pending.get(cseq)
+            return transaction.original_msg if transaction is not None else None
         if pending:
             return pending[max(pending)].original_msg
         return None
@@ -410,10 +428,13 @@ class Dialog(DialogBase):
         building a plain CANCEL from the arguments is kept.
         """
         if request is None:
-            request = self._pending_invite(kwargs.pop('cseq', None))
+            # cseq stays in kwargs: the fallback below still needs it to build
+            # a CANCEL with the CSeq the caller asked for.
+            request = self._pending_invite(kwargs.get('cseq'))
 
         if request is not None:
-            cancel = self._prepare_cancel(request, headers=kwargs.get('headers'))
+            kwargs.pop('cseq', None)  # taken from the request being cancelled
+            cancel = self._prepare_cancel(request, *args, **kwargs)
         else:
             cancel = self._prepare_request('CANCEL', *args, **kwargs)
         self.peer.send_message(cancel)
@@ -551,8 +572,17 @@ class InviteDialog(DialogBase):
         )
 
         # Responses are routed by the initial INVITE's CSeq, so the retry
-        # becomes the request this dialog is waiting on.
+        # becomes the request this dialog is waiting on. dialog_id is derived
+        # from original_msg's To, so the dialog has to be re-registered under
+        # the new (untagged) key; the tag learned from the challenge does not
+        # carry over, and RFC 3261 8.2.6.2 lets the UAS pick a new one for the
+        # authenticated transaction.
+        with suppress(KeyError):
+            del self.app._dialogs[self.dialog_id]
+        self.to_details = to_details  # same object as the retry's To
         self.original_msg = retry
+        self.app._dialogs[self.dialog_id] = self
+
         self._state = CallState.Calling
         self.peer.send_message(retry)
         return True
@@ -617,14 +647,17 @@ class InviteDialog(DialogBase):
                 try:
                     async with Timeout(timeout):
                         await transaction.start()
-                        if msg.method == 'CANCEL':
-                            # RFC 3261 section 9.1: the 200 to the CANCEL does not
-                            # end the INVITE transaction. Its final response
-                            # (normally 487) still has to arrive and be ACKed, so
-                            # the dialog must stay registered until then. 64*T1
-                            # is how long the UAS retransmits that response.
-                            with suppress(asyncio.TimeoutError):
-                                await asyncio.wait_for(asyncio.shield(self._waiter), timeout=64 * 0.5)
+
+                    if msg.method == 'CANCEL':
+                        # RFC 3261 section 9.1: the 200 to the CANCEL does not end
+                        # the INVITE transaction. Its final response (normally
+                        # 487) still has to arrive and be ACKed, so the dialog
+                        # stays registered a little longer. Outside the Timeout
+                        # above and with its own bound: the CANCEL itself was
+                        # answered, so a missing 487 must not fail close().
+                        wait = timeout if timeout is not None else CANCEL_FINAL_RESPONSE_TIMEOUT
+                        with suppress(asyncio.TimeoutError):
+                            await asyncio.wait_for(asyncio.shield(self._waiter), timeout=wait)
                 finally:
                     self._close()
 

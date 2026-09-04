@@ -2,7 +2,6 @@ import asyncio
 import logging
 
 import aiosip
-from aiosip.auth import Auth
 from multidict import CIMultiDict
 
 from .contact import Contact
@@ -61,7 +60,7 @@ class BaseTransaction:
             call_id=self.original_msg.headers['Call-ID']
         )))
 
-    def _handle_authenticate(self, msg):
+    def _handle_authenticate(self, msg, header='Authorization'):
         if self.dialog.password is None:
             raise ValueError('Password required for authentication')
 
@@ -84,7 +83,9 @@ class BaseTransaction:
         # branch, instead of mutating the request that is already on the wire.
         previous = self.original_msg
         headers = CIMultiDict(previous.headers)
-        for name in ('Via', 'CSeq', 'Content-Length', 'Authorization'):
+        # Credentials are recomputed for the challenge's nonce; a stale one
+        # copied along would be rejected and the retry would loop.
+        for name in ('Via', 'CSeq', 'Content-Length', 'Authorization', 'Proxy-Authorization'):
             headers.popall(name, None)
         # RFC 3261 section 8.1.3.5: same Call-ID, To and From as the previous
         # request. The dialog's To object has meanwhile been stamped with the
@@ -95,7 +96,7 @@ class BaseTransaction:
             to_details = previous.to_details
         retry = self.dialog._prepare_request(previous.method, headers=headers, payload=previous.payload,
                                              to_details=to_details)
-        retry.headers['Authorization'] = msg.auth.generate_authorization(
+        retry.headers[header] = msg.auth.generate_authorization(
             username=username,
             password=self.dialog.password,
             payload=msg.payload,
@@ -110,19 +111,13 @@ class BaseTransaction:
         self.authentification = asyncio.ensure_future(self._timer())
 
     def _handle_proxy_authenticate(self, msg):
-        self._handle_proxy_authenticate(msg)
-        self.original_msg = self.original_msg.pop(msg.cseq)
-        del (self.original_msg.headers['CSeq'])
-        self.original_msg.headers['Proxy-Authorization'] = str(Auth.from_authenticate_header(
-            authenticate=msg.headers['Proxy-Authenticate'],
-            method=msg.method,
-            uri=str(self.to_details),
-            username=self.to_details['uri']['user'],
-            password=self.dialog.password))
-        self.dialog.send_message(msg.method,
-                                 headers=self.original_msg.headers,
-                                 payload=self.original_msg.payload,
-                                 future=self.futrue)
+        """Retry with proxy credentials (RFC 3261 section 26.2.4).
+
+        Identical to :meth:`_handle_authenticate` except that the challenge
+        comes from Proxy-Authenticate and the answer goes in
+        Proxy-Authorization; ``msg.auth`` parses either header.
+        """
+        return self._handle_authenticate(msg, header='Proxy-Authorization')
 
     def __repr__(self):
         return '<{0} cseq={1}, method={2}, dialog={3}>'.format(
@@ -155,7 +150,7 @@ class FutureTransaction(BaseTransaction):
 
         if status_code == 401 and msg.auth:
             self._handle_authenticate(msg)
-        elif status_code == 407:  # Proxy authentication
+        elif status_code == 407 and msg.auth:  # Proxy authentication
             self._handle_proxy_authenticate(msg)
         elif 100 <= status_code < 200:
             pass

@@ -75,6 +75,8 @@ class Auth(MutableMapping):
             return cls.from_authorization_header(message.headers['Authorization'], message.method)
         elif 'WWW-Authenticate' in message.headers:
             return cls.from_authenticate_header(message.headers['WWW-Authenticate'], message.method)
+        elif 'Proxy-Authenticate' in message.headers:
+            return cls.from_authenticate_header(message.headers['Proxy-Authenticate'], message.method)
         else:
             return None
 

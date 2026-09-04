@@ -558,3 +558,339 @@ async def test_invite_dialog_authenticates(test_server, protocol, loop, from_det
     await call.close(timeout=2)
     await app.close()
     await server_app.close()
+
+
+async def test_auth_retry_keeps_the_dialog_registered(test_server, protocol, loop, from_details, to_details):
+    """After the authenticated retry the dialog must still be findable.
+
+    dialog_id is derived from the sent request's To, so swapping the request
+    without re-registering leaks the dialog and drops its responses.
+    """
+    password = 'abcdefg'
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.unauthorized(message)
+            async for message in dialog:
+                if message.method == 'INVITE':
+                    await dialog.reply(message, 200)
+                elif message.method == 'BYE':
+                    await dialog.reply(message, 200)
+                    break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        password=password,
+    )
+    await asyncio.wait_for(call.ready(), timeout=5)
+
+    # registered under the key dialog_id currently computes
+    assert app._dialogs.get(call.dialog_id) is call
+
+    await call.close(timeout=2)
+    # and removed again on close, rather than leaking for the process lifetime
+    assert call not in app._dialogs.values()
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_auth_retry_survives_a_new_to_tag(test_server, protocol, loop, from_details, to_details):
+    """RFC 3261 8.2.6.2: the UAS may pick a different To tag for the
+    authenticated transaction; its 200 must still reach the dialog."""
+    password = 'abcdefg'
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.unauthorized(message)
+            async for message in dialog:
+                if message.method == 'INVITE':
+                    await dialog.reply(message, 200)
+                elif message.method == 'BYE':
+                    await dialog.reply(message, 200)
+                    break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    server = await test_server(server_app)
+
+    # Rewrite the To tag on every response after the challenge, as a UAS that
+    # generates a fresh tag per transaction would.
+    original_dispatch = app._dispatch
+    seen = collections.Counter()
+
+    async def retagging_dispatch(protocol_, msg, addr):
+        if isinstance(msg, aiosip.message.Response):
+            seen['response'] += 1
+            if seen['response'] > 1:
+                msg.headers['To'] = '{};tag=confirmed'.format(
+                    str(msg.to_details).split(';tag=')[0])
+                del msg._to_details
+        return await original_dispatch(protocol_, msg, addr)
+
+    app._dispatch = retagging_dispatch
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        password=password,
+    )
+    await asyncio.wait_for(call.ready(), timeout=5)
+    assert call.to_details['params']['tag'] == 'confirmed'
+
+    await call.close(timeout=2)
+    await app.close()
+    await server_app.close()
+
+
+async def test_close_is_bounded_when_the_487_never_arrives(test_server, protocol, loop, from_details, to_details):
+    """A peer that answers the CANCEL and then stops must not block close()."""
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=180)
+            async for msg in dialog:
+                if msg.method == 'CANCEL':
+                    await dialog.reply(msg, status_code=200)
+                    break  # no 487 ever follows
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+    )
+    await asyncio.wait_for(call.recv(), timeout=5)
+
+    started = loop.time()
+    # an explicit timeout bounds the wait and must not raise: the CANCEL
+    # itself was answered
+    await asyncio.wait_for(call.close(timeout=1), timeout=5)
+    assert loop.time() - started < 4
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_proxy_challenge_is_retried(test_server, protocol, loop, from_details, to_details):
+    """A 407 must be answered with Proxy-Authorization, not hang or recurse."""
+    password = 'abcdefg'
+    received_messages = list()
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.subscribe
+
+        async def subscribe(self, request, message):
+            dialog = request._create_dialog()
+            auth = aiosip.auth.AuthenticateAuth(
+                mode='Digest', nonce='proxynonce', realm='proxy', algorithm='md5',
+                method=message.method)
+            await dialog.reply(message, status_code=407,
+                               headers={'Proxy-Authenticate': str(auth)})
+            async for message in dialog:
+                await dialog.reply(message, 200)
+                break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    record_requests(server_app, received_messages)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    dialog = await asyncio.wait_for(peer.subscribe(
+        expires=1800,
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        password=password,
+    ), timeout=5)
+    assert dialog.status_code == 200
+
+    subscribes = [m for m in received_messages if m.method == 'SUBSCRIBE']
+    assert len(subscribes) == 2
+    first, retry = subscribes
+    assert 'Proxy-Authorization' in retry.headers
+    assert 'Authorization' not in retry.headers
+    assert retry.cseq == first.cseq + 1
+    assert branch_of(retry) != branch_of(first)
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_stale_proxy_credential_is_not_copied(test_server, protocol, loop, from_details, to_details):
+    """A Proxy-Authorization from an earlier nonce must not ride along."""
+    password = 'abcdefg'
+    received_messages = list()
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.subscribe
+
+        async def subscribe(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.unauthorized(message)
+            async for message in dialog:
+                await dialog.reply(message, 200)
+                break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    record_requests(server_app, received_messages)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    await asyncio.wait_for(peer.subscribe(
+        expires=1800,
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        headers={'Proxy-Authorization': 'Digest nonce="stale"'},
+        password=password,
+    ), timeout=5)
+
+    subscribes = [m for m in received_messages if m.method == 'SUBSCRIBE']
+    assert len(subscribes) == 2
+    retry = subscribes[1]
+    assert 'Authorization' in retry.headers
+    assert 'Proxy-Authorization' not in retry.headers
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_retransmitted_2xx_is_answered_with_the_same_ack(
+        test_server, protocol, loop, from_details, to_details):
+    """RFC 3261 13.2.2.4: retransmit the ACK, do not start a new transaction."""
+    acks = list()
+    second_ack = loop.create_future()
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=200)
+            await asyncio.sleep(0.1)
+            await dialog.reply(message, status_code=200)  # our ACK was 'lost'
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    received_messages = list()
+    record_requests(server_app, received_messages, {'ACK': (2, second_ack)})
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+    )
+    await asyncio.wait_for(call.ready(), timeout=5)
+    await asyncio.wait_for(second_ack, timeout=5)
+    acks.extend(m for m in received_messages if m.method == 'ACK')
+
+    assert len(acks) == 2
+    # one client transaction retransmitting, so the same branch both times
+    assert branch_of(acks[0]) == branch_of(acks[1])
+    assert acks[0].cseq == acks[1].cseq
+
+    await app.close()
+    await server_app.close()
+
+
+def test_cancel_without_pending_invite_keeps_the_requested_cseq():
+    """dialog.cancel(cseq=N) must build a CANCEL with CSeq N, and an unknown
+    CSeq must not raise out of a cleanup path."""
+    sent = list()
+
+    dialog = aiosip.dialog.Dialog.__new__(aiosip.dialog.Dialog)
+    dialog.transactions = {}
+    dialog.cseq = 5
+    dialog.peer = type('P', (), {'send_message': lambda self, msg: sent.append(msg)})()
+
+    def prepare(method, contact_details=None, headers=None, payload=None, cseq=None, to_details=None):
+        return {'method': method, 'cseq': cseq, 'headers': headers, 'payload': payload,
+                'contact_details': contact_details}
+
+    dialog._prepare_request = prepare
+
+    # no pending INVITE: the requested cseq survives instead of being dropped
+    dialog.cancel(cseq=3)
+    assert sent[-1]['cseq'] == 3
+    # and an unknown cseq is a no-op-ish CANCEL, not a ValueError
+    assert dialog._pending_invite(99) is None
+
+
+def test_cancel_forwards_payload_and_contact_details():
+    """Both cancel() paths honour the same arguments."""
+    sent = list()
+
+    dialog = aiosip.dialog.Dialog.__new__(aiosip.dialog.Dialog)
+    invite = type('M', (), {'cseq': 4, 'headers': {'Via': 'SIP/2.0/UDP h:5060;branch=z9hG4bKx',
+                                                   'To': '<sip:a@h>'},
+                            'to_details': None})()
+    dialog.transactions = {'INVITE': {4: type('T', (), {'original_msg': invite})()}}
+    dialog.peer = type('P', (), {'send_message': lambda self, msg: sent.append(msg)})()
+
+    def prepare(method, contact_details=None, headers=None, payload=None, cseq=None, to_details=None):
+        return {'method': method, 'cseq': cseq, 'payload': payload,
+                'contact_details': contact_details}
+
+    dialog._prepare_request = prepare
+
+    dialog.cancel(payload='body', contact_details='contact')
+    assert sent[-1]['cseq'] == 4          # from the pending INVITE
+    assert sent[-1]['payload'] == 'body'  # not silently dropped
+    assert sent[-1]['contact_details'] == 'contact'
