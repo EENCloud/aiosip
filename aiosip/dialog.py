@@ -116,7 +116,17 @@ class DialogBase:
     def ack(self, msg, headers=None, *args, **kwargs):
         headers = CIMultiDict(headers or {})
 
-        headers['Via'] = msg.headers['Via']
+        # RFC 3261 section 17.1.1.3: the ACK for a non-2xx final response is
+        # part of the INVITE transaction and must carry the INVITE's top Via
+        # (same branch). Section 13.2.2.4 with 8.1.1.7: the ACK for a 2xx is
+        # a new transaction and must carry a new branch. The INVITE's own Via
+        # is used as base so that received/rport parameters added by the
+        # remote side are not copied into the ACK.
+        via = self.original_msg.headers['Via']
+        status_code = getattr(msg, 'status_code', None)
+        if status_code is not None and 200 <= status_code < 300:
+            via = utils.replace_branch(via)
+        headers['Via'] = via
         ack = self._prepare_request('ACK', cseq=msg.cseq, to_details=msg.to_details, headers=headers, *args, **kwargs)
         self.peer.send_message(ack)
 

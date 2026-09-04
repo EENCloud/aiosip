@@ -3,7 +3,22 @@ import pytest
 import asyncio
 import itertools
 
+from aiosip.pytest_plugin import loop_context
+
 pytest_plugins = ['aiosip.pytest_plugin']
+
+
+@pytest.fixture
+def loop(request):
+    """Event loop for the tests.
+
+    The plugin's ``loop`` fixture is parametrized from a list that is only
+    filled in ``pytest_configure``, which recent pytest evaluates too late, so
+    the tests were silently skipped with an empty parameter set.
+    """
+    fast = request.config.getoption('--fast')
+    with loop_context(asyncio.new_event_loop, fast=fast) as _loop:
+        yield _loop
 
 
 class TestServer:
@@ -14,7 +29,7 @@ class TestServer:
         self._loop = loop
 
     async def start_server(self, protocol, *, loop=None):
-        self.handler = self.app.run(
+        self.handler = await self.app.run(
             protocol=protocol,
             local_addr=(self.sip_config['server_host'], self.sip_config['server_port'])
         )
@@ -53,13 +68,13 @@ def protocol(request):
     pytest.fail('Test requested unknown protocol: {}'.format(request.param))
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def test_server(protocol, loop):
     servers = []
 
     async def go(handler, **kwargs):
         server = TestServer(handler)
-        yield await server.start_server(protocol, loop=loop, **kwargs)
+        await server.start_server(protocol, loop=loop, **kwargs)
         servers.append(server)
         return server
 
@@ -67,18 +82,18 @@ def test_server(protocol, loop):
 
     async def finalize():
         while servers:
-            yield await servers.pop().close()
+            await servers.pop().close()
 
     loop.run_until_complete(finalize())
 
 
-@pytest.yield_fixture
+@pytest.fixture
 def test_proxy(protocol, loop):
     servers = []
 
     async def go(handler, **kwargs):
         server = TestProxy(handler)
-        yield await server.start_server(protocol, loop=loop, **kwargs)
+        await server.start_server(protocol, loop=loop, **kwargs)
         servers.append(server)
         return server
 
@@ -86,7 +101,7 @@ def test_proxy(protocol, loop):
 
     async def finalize():
         while servers:
-            yield await servers.pop().close()
+            await servers.pop().close()
 
     loop.run_until_complete(finalize())
 
@@ -107,11 +122,6 @@ def to_details(request):
         host='127.0.0.1',
         port=6000
     )
-
-
-@pytest.fixture
-def loop(event_loop):
-    return event_loop
 
 
 @pytest.fixture(params=itertools.permutations(('client', 'server')))

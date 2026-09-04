@@ -157,7 +157,9 @@ class Peer:
         self._protocol = None
         self._disconnected_future.set_result(None)
 
-    def generate_via_headers(self, branch=utils.gen_branch()):
+    def generate_via_headers(self, branch=None):
+        if branch is None:
+            branch = utils.gen_branch()
         return f'SIP/2.0/{self._protocol.via} {self.local_addr[0]}:{self.local_addr[1]};branch={branch}'
 
     @property

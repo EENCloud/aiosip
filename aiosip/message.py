@@ -85,7 +85,7 @@ class Message:
             self.headers['Via'] = 'SIP/2.0/%(protocol)s ' + \
                 utils.format_host_and_port(self.contact_details['uri']['host'],
                                            self.contact_details['uri']['port']) + \
-                ';branch=%s' % utils.gen_branch(10)
+                ';branch=%s' % utils.gen_branch()
 
     @property
     def auth(self):

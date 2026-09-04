@@ -3,6 +3,7 @@ import logging
 
 import aiosip
 from aiosip.auth import Auth
+from . import utils
 from .exceptions import AuthentificationFailed
 
 
@@ -75,7 +76,12 @@ class BaseTransaction:
         else:
             username = msg.from_details['uri']['user']
 
+        # RFC 3261 sections 8.1.3.5 and 17.1.3: the request re-sent with
+        # credentials is a new transaction, so it needs a new branch. Reusing
+        # the branch makes a compliant UAS match it to the completed 401
+        # transaction and simply retransmit the 401.
         self.original_msg.cseq += 1
+        self.original_msg.headers['Via'] = utils.replace_branch(self.original_msg.headers['Via'])
         self.original_msg.headers['Authorization'] = msg.auth.generate_authorization(
             username=username,
             password=self.dialog.password,
