@@ -87,22 +87,28 @@ def pytest_configure(config):
     if tokio is not None:  # pragma: no cover
         factories['tokio'] = tokio.new_event_loop
 
-    LOOP_FACTORIES.clear()
-    LOOP_FACTORY_IDS.clear()
-
     if loops == 'all':
         loops = 'pyloop,uvloop?,tokio?'
 
+    selected = []
     for name in loops.split(','):
         required = not name.endswith('?')
         name = name.strip(' ?')
         if name in factories:
-            LOOP_FACTORIES.append(factories[name])
-            LOOP_FACTORY_IDS.append(name)
+            selected.append((name, factories[name]))
         elif required:
             raise ValueError(
                 "Unknown loop '%s', available loops: %s" % (
                     name, list(factories.keys())))
+
+    if not selected:
+        raise pytest.UsageError(
+            "--loop %r selected no available event loop" % config.getoption('--loop'))
+
+    config._aiosip_loops = selected
+    # Kept in sync for anything still reading the module level lists.
+    LOOP_FACTORY_IDS[:] = [name for name, _ in selected]
+    LOOP_FACTORIES[:] = [factory for _, factory in selected]
     asyncio.set_event_loop(None)
 
 
@@ -128,18 +134,34 @@ def pytest_pyfunc_call(pyfuncitem):
 def pytest_generate_tests(metafunc):
     """Parametrize the ``loop`` fixture with the loops selected by ``--loop``.
 
-    LOOP_FACTORIES is only filled in pytest_configure, which is too late for a
+    The selection is only known in pytest_configure, which is too late for a
     ``params=`` argument on the fixture decorator (evaluated at import time),
-    so the parametrization is applied here, at collection time.
+    so the parametrization happens here, at collection time. Tests and
+    downstream conftests that parametrize ``loop`` themselves are left alone.
     """
-    if 'loop' in metafunc.fixturenames:
-        metafunc.parametrize('loop', LOOP_FACTORIES, ids=LOOP_FACTORY_IDS, indirect=True)
+    if 'loop' not in metafunc.fixturenames:
+        return
+
+    fixturedefs = metafunc._arg2fixturedefs.get('loop')
+    if not fixturedefs or getattr(fixturedefs[-1].func, '__module__', None) != __name__:
+        return  # a downstream conftest provides its own loop fixture
+
+    for marker in metafunc.definition.iter_markers('parametrize'):
+        argnames = marker.args[0] if marker.args else marker.kwargs.get('argnames', '')
+        if isinstance(argnames, str):
+            argnames = [name.strip() for name in argnames.split(',')]
+        if 'loop' in argnames:
+            return
+
+    loops = metafunc.config._aiosip_loops
+    metafunc.parametrize('loop', [factory for _, factory in loops],
+                         ids=[name for name, _ in loops], indirect=True)
 
 
 @pytest.fixture
 def loop(request):
-    """Return an instance of the event loop."""
-    loop_factory = getattr(request, 'param', asyncio.new_event_loop)
+    """Return an instance of the event loop selected by ``--loop``."""
+    loop_factory = request.param
     fast = request.config.getoption('--fast')
     debug = request.config.getoption('--enable-loop-debug')
 

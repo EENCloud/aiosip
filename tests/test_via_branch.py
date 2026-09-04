@@ -1,5 +1,8 @@
 import asyncio
+import collections
 import re
+
+import pytest
 
 import aiosip
 from aiosip import utils
@@ -24,14 +27,23 @@ def record_requests(server_app, received_messages, futures_by_method=None):
 
     The server dialog does not hand ACK to the dialplan, so this is the only
     place to observe what really arrived on the wire.
+
+    ``futures_by_method`` maps a method to a future resolved when it arrives,
+    or to a ``(count, future)`` pair to wait for the count-th one.
     """
     original_dispatch = server_app._dispatch
+    seen = collections.Counter()
 
     async def recording_dispatch(protocol, msg, addr):
         if isinstance(msg, aiosip.message.Request):
             received_messages.append(msg)
-            future = (futures_by_method or {}).get(msg.method)
-            if future is not None and not future.done():
+            seen[msg.method] += 1
+            entry = (futures_by_method or {}).get(msg.method)
+            if isinstance(entry, tuple):
+                wanted, future = entry
+            else:
+                wanted, future = 1, entry
+            if future is not None and seen[msg.method] >= wanted and not future.done():
                 future.set_result(None)
         return await original_dispatch(protocol, msg, addr)
 
@@ -96,6 +108,9 @@ async def test_authentication_retry_is_a_new_transaction(test_server, protocol, 
     assert branch_of(retry) != branch_of(first)
     assert branch_of(retry).startswith(utils.BRANCH_MAGIC_COOKIE)
     assert sent_by_of(retry) == sent_by_of(first)
+    # RFC 3261 8.1.3.5: same To as the previous request, i.e. still untagged
+    assert 'tag' not in retry.to_details['params']
+    assert retry.headers['To'] == first.headers['To']
     # the original headers travel with the retry and the dialog keeps counting
     assert retry.headers['X-Custom'] == 'kept'
     assert retry.headers['Expires'] == '1800'
@@ -198,9 +213,12 @@ async def test_cancel_belongs_to_invite_transaction(test_server, protocol, loop,
             await dialog.reply(message, status_code=180)
             async for msg in dialog:
                 if msg.method == 'CANCEL':
-                    # RFC 3261 9.2: 487 to the INVITE, 200 to the CANCEL
-                    await dialog.reply(message, status_code=487)
+                    # RFC 3261 9.2 order: 200 to the CANCEL first, then the
+                    # 487 to the INVITE. The dialog must survive the former to
+                    # still be able to ACK the latter.
                     await dialog.reply(msg, status_code=200)
+                    await asyncio.sleep(0.05)
+                    await dialog.reply(message, status_code=487)
                     break
 
     app = aiosip.Application(loop=loop)
@@ -235,5 +253,308 @@ async def test_cancel_belongs_to_invite_transaction(test_server, protocol, loop,
     assert ack.cseq == invite.cseq
     assert branch_of(ack) == branch_of(invite)
 
+    await app.close()
+    await server_app.close()
+
+
+async def test_cancel_before_any_response_survives_tagless_cancel_response(
+        test_server, protocol, loop, from_details, to_details):
+    """CANCEL answered with a tagless response must not unregister the dialog."""
+    received_messages = list()
+    futures = {'ACK': loop.create_future()}
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            async for msg in dialog:
+                if msg.method == 'CANCEL':
+                    # No to-tag on this response, as a UAS answering a CANCEL
+                    # for a dialog it has not confirmed may do.
+                    await dialog.reply(msg, status_code=200, headers={'To': str(msg.to_details)})
+                    await asyncio.sleep(0.05)
+                    await dialog.reply(message, status_code=487)
+                    break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    record_requests(server_app, received_messages, futures)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+    )
+    await asyncio.sleep(0.05)
+    await call.close(timeout=5)
+    await asyncio.wait_for(futures['ACK'], timeout=5)
+
+    by_method = {m.method: m for m in received_messages}
+    invite, ack = by_method['INVITE'], by_method['ACK']
+    assert branch_of(ack) == branch_of(invite)
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_non_2xx_to_transaction_invite_is_acked(test_server, protocol, loop, from_details, to_details):
+    """RFC 3261 17.1.1.3: a non-2xx final to an INVITE sent through a
+    transaction (not InviteDialog) must be ACKed too."""
+    received_messages = list()
+    futures = {'ACK': loop.create_future()}
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=488)
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    record_requests(server_app, received_messages, futures)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    dialog = await peer.request(
+        'INVITE',
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        dialog_factory=aiosip.dialog.Dialog,
+    )
+    assert dialog.status_code == 488
+    await asyncio.wait_for(futures['ACK'], timeout=5)
+
+    by_method = {m.method: m for m in received_messages}
+    invite, ack = by_method['INVITE'], by_method['ACK']
+    # part of the INVITE transaction: same branch and CSeq number
+    assert ack.cseq == invite.cseq
+    assert branch_of(ack) == branch_of(invite)
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_dialog_cancel_uses_the_pending_invite(test_server, protocol, loop, from_details, to_details):
+    """Dialog.cancel() must cancel the INVITE that was actually sent, not the
+    unsent template request the dialog was built from."""
+    received_messages = list()
+    futures = {'CANCEL': loop.create_future()}
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=180)
+            async for msg in dialog:
+                if msg.method == 'CANCEL':
+                    await dialog.reply(msg, status_code=200)
+                    await dialog.reply(message, status_code=487)
+                    break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    record_requests(server_app, received_messages, futures)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    task = loop.create_task(peer.request(
+        'INVITE',
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        dialog_factory=aiosip.dialog.Dialog,
+    ))
+    await asyncio.sleep(0.2)
+    task.cancel()  # peers.request() calls dialog.cancel() on cancellation
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.wait_for(futures['CANCEL'], timeout=5)
+
+    by_method = {m.method: m for m in received_messages}
+    invite, cancel = by_method['INVITE'], by_method['CANCEL']
+    # RFC 3261 9.1: CSeq number, To and top Via all match the sent INVITE
+    assert cancel.cseq == invite.cseq
+    assert cancel.headers['Via'] == invite.headers['Via']
+    assert str(cancel.to_details) == str(invite.to_details)
+    assert 'tag' not in cancel.to_details['params']
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_unrecognised_2xx_is_treated_as_200(test_server, protocol, loop, from_details, to_details):
+    """RFC 3261 8.1.3.2: a 2xx that is not 200 still terminates the call."""
+    received_messages = list()
+    futures = {'ACK': loop.create_future()}
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=202)
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    record_requests(server_app, received_messages, futures)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+    )
+    msg = await asyncio.wait_for(call.recv(), timeout=5)
+    assert msg.status_code == 202
+    await asyncio.wait_for(futures['ACK'], timeout=5)
+    assert call.state is aiosip.dialog.CallState.Terminated
+
+    by_method = {m.method: m for m in received_messages}
+    invite, ack = by_method['INVITE'], by_method['ACK']
+    # 2xx: the ACK is a new transaction
+    assert branch_of(ack) != branch_of(invite)
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_retransmitted_final_is_reacked_and_not_passed_up(
+        test_server, protocol, loop, from_details, to_details):
+    """A retransmitted final response is ACKed again but reaches the user once."""
+    acks = list()
+    second_ack = loop.create_future()
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=486)
+            await asyncio.sleep(0.1)
+            await dialog.reply(message, status_code=486)  # our ACK was 'lost'
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    received_messages = list()
+    record_requests(server_app, received_messages, {'ACK': (2, second_ack)})
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+    )
+    responses = list()
+    async for msg in call.wait_for_terminate(timeout=2):
+        responses.append(msg.status_code)
+    await asyncio.wait_for(second_ack, timeout=5)
+    acks.extend(m for m in received_messages if m.method == 'ACK')
+
+    # the retransmission was ACKed again but never queued for the user
+    assert responses == [486]
+    assert call._queue.empty()
+    assert len(acks) == 2
+    assert branch_of(acks[0]) == branch_of(acks[1])
+
+    await call.close(timeout=2)
+    await app.close()
+    await server_app.close()
+
+
+async def test_invite_dialog_authenticates(test_server, protocol, loop, from_details, to_details):
+    """peer.invite(password=...) must answer a challenge instead of failing.
+
+    The initial INVITE is sent outside a transaction, so the dialog itself
+    has to retry it with credentials.
+    """
+    password = 'abcdefg'
+    received_messages = list()
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.unauthorized(message)
+            async for message in dialog:
+                if message.method == 'INVITE':
+                    if dialog.validate_auth(message=message, password=password):
+                        await dialog.reply(message, 200)
+                    else:
+                        await dialog.unauthorized(message)
+                elif message.method == 'BYE':
+                    await dialog.reply(message, 200)
+                    break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    both_acks = loop.create_future()
+    record_requests(server_app, received_messages, {'ACK': (2, both_acks)})
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        password=password,
+    )
+    await asyncio.wait_for(call.ready(), timeout=5)
+    await asyncio.wait_for(both_acks, timeout=5)
+    assert call.state is aiosip.dialog.CallState.Terminated
+
+    invites = [m for m in received_messages if m.method == 'INVITE']
+    acks = [m for m in received_messages if m.method == 'ACK']
+    assert len(invites) == 2
+    first, retry = invites
+    assert 'Authorization' in retry.headers
+    # a new transaction: new CSeq and new branch, To still untagged
+    assert retry.cseq == first.cseq + 1
+    assert branch_of(retry) != branch_of(first)
+    assert 'tag' not in retry.to_details['params']
+    # the 401 is ACKed within the INVITE transaction, the 200 with a new branch
+    assert len(acks) == 2
+    assert branch_of(acks[0]) == branch_of(first)
+    assert branch_of(acks[1]) not in (branch_of(first), branch_of(retry))
+
+    await call.close(timeout=2)
     await app.close()
     await server_app.close()

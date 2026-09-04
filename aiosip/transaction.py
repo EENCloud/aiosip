@@ -5,6 +5,7 @@ import aiosip
 from aiosip.auth import Auth
 from multidict import CIMultiDict
 
+from .contact import Contact
 from .exceptions import AuthentificationFailed
 
 
@@ -85,8 +86,15 @@ class BaseTransaction:
         headers = CIMultiDict(previous.headers)
         for name in ('Via', 'CSeq', 'Content-Length', 'Authorization'):
             headers.popall(name, None)
+        # RFC 3261 section 8.1.3.5: same Call-ID, To and From as the previous
+        # request. The dialog's To object has meanwhile been stamped with the
+        # 401's tag, so the To is taken back from the request as it was sent.
+        if 'To' in previous.headers:
+            to_details = Contact.from_header(previous.headers['To'])
+        else:
+            to_details = previous.to_details
         retry = self.dialog._prepare_request(previous.method, headers=headers, payload=previous.payload,
-                                             to_details=previous.to_details)
+                                             to_details=to_details)
         retry.headers['Authorization'] = msg.auth.generate_authorization(
             username=username,
             password=self.dialog.password,
@@ -136,16 +144,20 @@ class FutureTransaction(BaseTransaction):
         super()._incoming(msg)
         if msg.method == 'ACK':
             self._result(msg)
-        elif msg.status_code == 401 and msg.auth:
-            self._handle_authenticate(msg)
             return
-        elif msg.status_code == 407:  # Proxy authentication
-            self._handle_proxy_authenticate(msg)
-            return
-        elif self.original_msg.method.upper() == 'INVITE' and msg.status_code == 200:
+
+        status_code = msg.status_code
+        if self.original_msg.method.upper() == 'INVITE' and status_code >= 200:
+            # RFC 3261 sections 17.1.1.3 and 13.2.2.4: every final response to an
+            # INVITE is acknowledged, 2xx and non-2xx alike, a 401/407 that is
+            # about to be retried with credentials included.
             self.dialog.ack(msg, request=self.original_msg)
-            self._result(msg)
-        elif 100 <= msg.status_code < 200:
+
+        if status_code == 401 and msg.auth:
+            self._handle_authenticate(msg)
+        elif status_code == 407:  # Proxy authentication
+            self._handle_proxy_authenticate(msg)
+        elif 100 <= status_code < 200:
             pass
         else:
             self._result(msg)
@@ -154,14 +166,16 @@ class FutureTransaction(BaseTransaction):
         if self.authentification:
             self.authentification.cancel()
             self.authentification = None
-        self._future.set_exception(error)
+        if not self._future.done():
+            self._future.set_exception(error)
         self.dialog.end_transaction(self)
 
     def _result(self, msg):
         if self.authentification:
             self.authentification.cancel()
             self.authentification = None
-        self._future.set_result(msg)
+        if not self._future.done():  # the awaiting task may have been cancelled
+            self._future.set_result(msg)
         self.dialog.end_transaction(self)
 
     def close(self):

@@ -13,6 +13,18 @@ History
   2xx is acknowledged again; longer, cryptographically random branches.
 * InviteDialog no longer passes responses to in-dialog requests (BYE, CANCEL)
   up through ``recv()``/``wait_for_terminate()``; they go to their transaction.
+  A 2xx other than 200 is treated as 200, and a retransmitted final response
+  is acknowledged again instead of being passed up a second time. After a
+  CANCEL the dialog stays registered until the INVITE's 487 is ACKed.
+* Every final response to an INVITE sent through a transaction (re-INVITE,
+  ``peer.request('INVITE')``) is acknowledged, not just a 200.
+* ``peer.invite(password=...)`` now answers a 401/407 challenge; the initial
+  INVITE is sent outside a transaction, so InviteDialog retries it itself.
+* ``Dialog.cancel()`` cancels the pending INVITE transaction (``cseq=``
+  picks one) instead of the unsent template request, and the authenticated
+  retry keeps the To header of the request as it was sent.
+* ``aiosip.pytest_plugin`` fails with a usage error when ``--loop`` selects
+  no loop, and leaves a ``loop`` fixture parametrized downstream alone.
 * Removed the unused ``Peer.generate_via_headers``.
 * Package version now comes from ``aiosip.__version__`` (also used in the
   default User-Agent).
