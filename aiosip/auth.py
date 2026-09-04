@@ -70,7 +70,18 @@ class Auth(MutableMapping):
         return auth
 
     @classmethod
-    def from_message(cls, message):
+    def from_message(cls, message, header=None):
+        """Parse the challenge or credential carried by ``message``.
+
+        ``header`` names the one to read, for a response that carries both a
+        WWW-Authenticate and a Proxy-Authenticate challenge: answering the
+        wrong one loops until the attempts run out.
+        """
+        if header is not None:
+            if header not in message.headers:
+                return None
+            return cls.from_authenticate_header(message.headers[header], message.method)
+
         if 'Authorization' in message.headers:
             return cls.from_authorization_header(message.headers['Authorization'], message.method)
         elif 'WWW-Authenticate' in message.headers:

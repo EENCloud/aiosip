@@ -9,10 +9,10 @@ from collections import defaultdict
 from async_timeout import timeout as Timeout
 
 from . import utils
-from .auth import AuthenticateAuth, AuthorizationAuth
+from .auth import Auth, AuthenticateAuth, AuthorizationAuth
 from .contact import Contact
 from .message import Request, Response, CompactHeaderResponse
-from .transaction import UnreliableTransaction
+from .transaction import CHALLENGE_HEADER, UnreliableTransaction
 
 
 LOG = logging.getLogger(__name__)
@@ -56,6 +56,10 @@ class DialogBase:
         self.inbound = inbound
         self.transactions = defaultdict(dict)
         self.auth = None
+        # Keys this dialog is registered under in app._dialogs. dialog_id
+        # changes as tags are learned and Peer._create_dialog adds a tagless
+        # fallback, so the keys are remembered rather than searched for.
+        self._dialog_keys = set()
         # ACKs sent for a 2xx, by CSeq: a retransmitted 2xx is answered with
         # the same ACK (RFC 3261 section 13.2.2.4), not a new transaction.
         self._acks = {}
@@ -72,12 +76,30 @@ class DialogBase:
                           self.original_msg.from_details['params']['tag'],
                           self.call_id))
 
+    def _register(self, key=None):
+        """Register this dialog in ``app._dialogs`` under ``key``."""
+        if key is None:
+            key = self.dialog_id
+        self._dialog_keys.add(key)
+        self.app._dialogs[key] = self
+
+    def _unregister(self, key=None):
+        """Remove this dialog from ``app._dialogs``, all its keys by default."""
+        if key is None:
+            keys, self._dialog_keys = self._dialog_keys, set()
+        else:
+            keys = {key}
+            self._dialog_keys.discard(key)
+        for key in keys:
+            if self.app._dialogs.get(key) is self:
+                del self.app._dialogs[key]
+
     def _receive_response(self, msg):
 
         if 'tag' not in self.to_details['params'] and 'tag' in msg.to_details['params']:
-            del self.app._dialogs[self.dialog_id]
+            self._unregister(self.dialog_id)
             self.to_details['params']['tag'] = msg.to_details['params']['tag']
-            self.app._dialogs[self.dialog_id] = self
+            self._register()
 
         try:
             transaction = self.transactions[msg.method][msg.cseq]
@@ -236,11 +258,9 @@ class DialogBase:
             for transaction in transactions.values():
                 transaction.close()
 
-        # A dialog is registered under more than one key (Peer._create_dialog
-        # adds a tagless fallback, and dialog_id changes as tags are learned),
-        # so every key pointing here goes, not just the current dialog_id.
-        for key in [k for k, dialog in self.app._dialogs.items() if dialog is self]:
-            del self.app._dialogs[key]
+        # A dialog is registered under more than one key, so all of them go,
+        # not just the current dialog_id.
+        self._unregister()
 
     def _connection_lost(self):
         for transactions in self.transactions.values():
@@ -355,14 +375,11 @@ class Dialog(DialogBase):
     async def _receive_request(self, msg):
 
         if 'tag' in msg.to_details['params']:
-            try:
-                del self.app._dialogs[
-                    frozenset((self.original_msg.to_details['params'].get('tag'),
-                               None,
-                               self.call_id))
-                ]
-            except KeyError:
-                pass
+            self._unregister(
+                frozenset((self.original_msg.to_details['params'].get('tag'),
+                           None,
+                           self.call_id))
+            )
 
         await self._incoming.put(msg)
         self._maybe_close(msg)
@@ -432,10 +449,15 @@ class Dialog(DialogBase):
             # a CANCEL with the CSeq the caller asked for.
             request = self._pending_invite(kwargs.get('cseq'))
 
-        if request is not None:
+        if request is not None and request.method == 'INVITE':
             kwargs.pop('cseq', None)  # taken from the request being cancelled
             cancel = self._prepare_cancel(request, *args, **kwargs)
         else:
+            # RFC 3261 section 9.1 restricts CANCEL to INVITE. For anything
+            # else keep the previous behaviour: a CANCEL of its own, with a
+            # fresh branch, so it is not matched to the live transaction.
+            if request is not None:
+                kwargs.setdefault('cseq', request.cseq)
             cancel = self._prepare_request('CANCEL', *args, **kwargs)
         self.peer.send_message(cancel)
 
@@ -460,9 +482,9 @@ class InviteDialog(DialogBase):
 
     async def receive_message(self, msg):  # noqa: C901
         if 'tag' not in self.to_details['params'] and 'tag' in msg.to_details['params']:
-            del self.app._dialogs[self.dialog_id]
+            self._unregister(self.dialog_id)
             self.to_details['params']['tag'] = msg.to_details['params']['tag']
-            self.app._dialogs[self.dialog_id] = self
+            self._register()
 
         async def set_result(msg):
             self.ack(msg)
@@ -564,7 +586,10 @@ class InviteDialog(DialogBase):
         retry = self._prepare_request(previous.method, headers=headers, payload=previous.payload,
                                       to_details=to_details)
         header = 'Proxy-Authorization' if msg.status_code == 407 else 'Authorization'
-        retry.headers[header] = msg.auth.generate_authorization(
+        # A response may carry both challenges; answer the one belonging to the
+        # header the credential goes into.
+        challenge = Auth.from_message(msg, header=CHALLENGE_HEADER[header]) or msg.auth
+        retry.headers[header] = challenge.generate_authorization(
             username=previous.from_details['uri']['user'],
             password=self.password,
             payload=msg.payload,
@@ -577,11 +602,10 @@ class InviteDialog(DialogBase):
         # the new (untagged) key; the tag learned from the challenge does not
         # carry over, and RFC 3261 8.2.6.2 lets the UAS pick a new one for the
         # authenticated transaction.
-        with suppress(KeyError):
-            del self.app._dialogs[self.dialog_id]
+        self._unregister(self.dialog_id)
         self.to_details = to_details  # same object as the retry's To
         self.original_msg = retry
-        self.app._dialogs[self.dialog_id] = self
+        self._register()
 
         self._state = CallState.Calling
         self.peer.send_message(retry)
@@ -616,7 +640,9 @@ class InviteDialog(DialogBase):
 
     async def ready(self):
         msg = await self._waiter
-        if msg.status_code != 200:
+        # RFC 3261 section 8.1.3.2: any 2xx establishes the call, as the state
+        # machine in receive_message() treats it.
+        if not 200 <= msg.status_code < 300:
             raise RuntimeError("INVITE failed with {}".format(msg.status_code))
 
     def end_transaction(self, transaction):
@@ -644,6 +670,7 @@ class InviteDialog(DialogBase):
                 transaction = UnreliableTransaction(self, original_msg=msg, loop=self.app.loop)
                 self.transactions[msg.method][msg.cseq] = transaction
 
+                deadline = None if timeout is None else self.app.loop.time() + timeout
                 try:
                     async with Timeout(timeout):
                         await transaction.start()
@@ -655,7 +682,10 @@ class InviteDialog(DialogBase):
                         # stays registered a little longer. Outside the Timeout
                         # above and with its own bound: the CANCEL itself was
                         # answered, so a missing 487 must not fail close().
-                        wait = timeout if timeout is not None else CANCEL_FINAL_RESPONSE_TIMEOUT
+                        wait = CANCEL_FINAL_RESPONSE_TIMEOUT
+                        if deadline is not None:
+                            # one budget for the whole call, not timeout twice
+                            wait = min(wait, max(0, deadline - self.app.loop.time()))
                         with suppress(asyncio.TimeoutError):
                             await asyncio.wait_for(asyncio.shield(self._waiter), timeout=wait)
                 finally:

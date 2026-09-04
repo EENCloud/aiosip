@@ -4,8 +4,16 @@ import logging
 import aiosip
 from multidict import CIMultiDict
 
+from .auth import Auth
 from .contact import Contact
 from .exceptions import AuthentificationFailed
+
+
+# Which challenge answers which credential header (RFC 3261 sections 22.2-22.3)
+CHALLENGE_HEADER = {
+    'Authorization': 'WWW-Authenticate',
+    'Proxy-Authorization': 'Proxy-Authenticate',
+}
 
 
 LOG = logging.getLogger(__name__)
@@ -64,6 +72,13 @@ class BaseTransaction:
         if self.dialog.password is None:
             raise ValueError('Password required for authentication')
 
+        # A response may carry both challenges; answer the one belonging to the
+        # header the credential goes into.
+        challenge = Auth.from_message(msg, header=CHALLENGE_HEADER[header]) or msg.auth
+        if challenge is None:
+            self._result(msg)
+            return
+
         self.attempts -= 1
         if self.attempts < 1:
             self._error(AuthentificationFailed('Too many unauthorized attempts!'))
@@ -96,7 +111,7 @@ class BaseTransaction:
             to_details = previous.to_details
         retry = self.dialog._prepare_request(previous.method, headers=headers, payload=previous.payload,
                                              to_details=to_details)
-        retry.headers[header] = msg.auth.generate_authorization(
+        retry.headers[header] = challenge.generate_authorization(
             username=username,
             password=self.dialog.password,
             payload=msg.payload,
@@ -108,6 +123,17 @@ class BaseTransaction:
         self.dialog.transactions[previous.method].pop(previous.cseq, None)
         self.original_msg = retry
         self.dialog.transactions[retry.method][retry.cseq] = self
+
+        # The retry goes out with an untagged To, and RFC 3261 8.2.6.2 lets the
+        # UAS pick a fresh tag for it. The dialog is registered under the tag
+        # learned from the challenge, and its tagless fallback key was dropped
+        # when that tag was learned, so a new tag would match neither. Forget
+        # the challenge's tag and re-register so the fallback matches again.
+        dialog = self.dialog
+        dialog._unregister(dialog.dialog_id)
+        dialog.to_details['params'].pop('tag', None)
+        dialog._register()
+
         self.authentification = asyncio.ensure_future(self._timer())
 
     def _handle_proxy_authenticate(self, msg):

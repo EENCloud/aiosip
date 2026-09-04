@@ -29,7 +29,18 @@ History
 * ``close()`` bounds its wait for the 487 after a CANCEL and never raises
   because that response is missing.
 * Closing a dialog removes every key it is registered under, not just the
-  current ``dialog_id``.
+  current ``dialog_id``; the keys are tracked on the dialog, so teardown
+  stays O(1) rather than scanning every live dialog.
+* The Dialog/transaction authentication retry re-registers its dialog too,
+  so a UAS that picks a fresh To tag for the authenticated transaction is
+  matched instead of having its response discarded.
+* A response carrying both a WWW-Authenticate and a Proxy-Authenticate
+  challenge is answered from the one matching the credential header.
+* ``CANCEL`` shares the request's branch and CSeq only for an INVITE
+  (RFC 3261 section 9.1); any other method gets a CANCEL of its own.
+* ``close(timeout=T)`` spends at most ``T`` in total, not ``T`` on the
+  CANCEL and ``T`` again on the 487.
+* ``InviteDialog.ready()`` accepts any 2xx, matching the state machine.
 * ``Dialog.cancel()`` cancels the pending INVITE transaction (``cseq=``
   picks one) instead of the unsent template request, and the authenticated
   retry keeps the To header of the request as it was sent.

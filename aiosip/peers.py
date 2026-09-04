@@ -79,10 +79,12 @@ class Peer:
         )
 
         LOG.debug('Creating dialog: %s', dialog)
-        self._app._dialogs[dialog.dialog_id] = dialog
-        self._app._dialogs[
+        dialog._register()
+        # Tagless fallback: the first response carries a tag the dialog does
+        # not know yet, so Application._dispatch matches on the From tag alone.
+        dialog._register(
             frozenset((dialog.original_msg.to_details['params'].get('tag'), None, dialog.call_id))
-        ] = dialog
+        )
         return dialog
 
     async def request(self, method, from_details, to_details, contact_details=None, password=None, call_id=None,
