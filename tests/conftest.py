@@ -1,24 +1,8 @@
 import aiosip
 import pytest
-import asyncio
 import itertools
 
-from aiosip.pytest_plugin import loop_context
-
 pytest_plugins = ['aiosip.pytest_plugin']
-
-
-@pytest.fixture
-def loop(request):
-    """Event loop for the tests.
-
-    The plugin's ``loop`` fixture is parametrized from a list that is only
-    filled in ``pytest_configure``, which recent pytest evaluates too late, so
-    the tests were silently skipped with an empty parameter set.
-    """
-    fast = request.config.getoption('--fast')
-    with loop_context(asyncio.new_event_loop, fast=fast) as _loop:
-        yield _loop
 
 
 class TestServer:
@@ -36,7 +20,9 @@ class TestServer:
         return self.handler
 
     async def close(self):
-        pass
+        # Release the bound server port even when a test fails before it
+        # closes the application itself. Application.close() is idempotent.
+        await self.app.close()
 
     @property
     def sip_config(self):

@@ -2,7 +2,7 @@
 
 __author__ = 'Ludovic Gasc (GMLudo)'
 __email__ = 'gmludo@gmail.com'
-__version__ = '0.1.0'
+__version__ = '0.2.7'
 
 from .dialog import *
 from .message import *

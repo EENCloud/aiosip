@@ -19,6 +19,25 @@ def sent_by_of(message):
     return via.split(';')[0]
 
 
+def record_requests(server_app, received_messages, futures_by_method=None):
+    """Record every request the server receives, in order, at dispatch level.
+
+    The server dialog does not hand ACK to the dialplan, so this is the only
+    place to observe what really arrived on the wire.
+    """
+    original_dispatch = server_app._dispatch
+
+    async def recording_dispatch(protocol, msg, addr):
+        if isinstance(msg, aiosip.message.Request):
+            received_messages.append(msg)
+            future = (futures_by_method or {}).get(msg.method)
+            if future is not None and not future.done():
+                future.set_result(None)
+        return await original_dispatch(protocol, msg, addr)
+
+    server_app._dispatch = recording_dispatch
+
+
 def test_gen_branch_has_magic_cookie_and_is_unique():
     branches = {utils.gen_branch() for _ in range(200)}
     assert len(branches) == 200
@@ -27,27 +46,7 @@ def test_gen_branch_has_magic_cookie_and_is_unique():
         assert len(branch) == len(utils.BRANCH_MAGIC_COOKIE) + 16
 
 
-def test_replace_branch_str():
-    via = 'SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKold;rport'
-    assert utils.replace_branch(via, 'z9hG4bKnew') == 'SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKnew;rport'
-    new = utils.replace_branch(via)
-    assert new != via
-    assert new.startswith('SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bK')
-    assert new.endswith(';rport')
-
-
-def test_replace_branch_without_branch_appends_one():
-    via = utils.replace_branch('SIP/2.0/UDP 10.0.0.1:5060', 'z9hG4bKnew')
-    assert via == 'SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKnew'
-
-
-def test_replace_branch_list_changes_only_top_via():
-    vias = ['SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKa', 'SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bKb']
-    assert utils.replace_branch(vias, 'z9hG4bKnew') == [
-        'SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKnew', 'SIP/2.0/UDP 10.0.0.2:5060;branch=z9hG4bKb']
-
-
-async def test_authentication_retry_uses_new_branch(test_server, protocol, loop, from_details, to_details):
+async def test_authentication_retry_is_a_new_transaction(test_server, protocol, loop, from_details, to_details):
     password = 'abcdefg'
     received_messages = list()
 
@@ -60,7 +59,10 @@ async def test_authentication_retry_uses_new_branch(test_server, protocol, loop,
         async def subscribe(self, request, message):
             dialog = request._create_dialog()
             received_messages.append(message)
+            # The 401 is sent twice, identical, as a UAS retransmitting over
+            # UDP would. The duplicate must not trigger a second retry.
             await dialog.unauthorized(message)
+            await dialog.reply(message, status_code=401, headers={'WWW-Authenticate': str(dialog.auth)})
 
             async for message in dialog:
                 received_messages.append(message)
@@ -77,12 +79,14 @@ async def test_authentication_retry_uses_new_branch(test_server, protocol, loop,
         protocol=protocol,
         remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
     )
-    await peer.subscribe(
+    dialog = await peer.subscribe(
         expires=1800,
         from_details=aiosip.Contact.from_header(from_details),
         to_details=aiosip.Contact.from_header(to_details),
+        headers={'X-Custom': 'kept'},
         password=password
     )
+    await asyncio.sleep(0.1)
 
     assert len(received_messages) == 2
     first, retry = received_messages
@@ -92,16 +96,19 @@ async def test_authentication_retry_uses_new_branch(test_server, protocol, loop,
     assert branch_of(retry) != branch_of(first)
     assert branch_of(retry).startswith(utils.BRANCH_MAGIC_COOKIE)
     assert sent_by_of(retry) == sent_by_of(first)
+    # the original headers travel with the retry and the dialog keeps counting
+    assert retry.headers['X-Custom'] == 'kept'
+    assert retry.headers['Expires'] == '1800'
+    assert dialog.cseq == retry.cseq
 
     await app.close()
     await server_app.close()
 
 
 async def invite_scenario(test_server, protocol, loop, from_details, to_details, status_code):
-    """Run INVITE -> final response -> ACK (-> BYE for a 2xx) and return every
-    request the server received, in order."""
+    """INVITE -> final response -> ACK (-> BYE for a 2xx); return the requests the server received."""
     received_messages = list()
-    ack_received = loop.create_future()
+    futures = {'ACK': loop.create_future()}
 
     class Dialplan(aiosip.BaseDialplan):
 
@@ -121,19 +128,7 @@ async def invite_scenario(test_server, protocol, loop, from_details, to_details,
 
     app = aiosip.Application(loop=loop)
     server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
-
-    # The server dialog does not hand the ACK to the dialplan, so record every
-    # incoming request at dispatch level to see what really arrived on the wire.
-    original_dispatch = server_app._dispatch
-
-    async def recording_dispatch(protocol, msg, addr):
-        if isinstance(msg, aiosip.message.Request):
-            received_messages.append(msg)
-            if msg.method == 'ACK' and not ack_received.done():
-                ack_received.set_result(None)
-        return await original_dispatch(protocol, msg, addr)
-
-    server_app._dispatch = recording_dispatch
+    record_requests(server_app, received_messages, futures)
     server = await test_server(server_app)
 
     peer = await app.connect(
@@ -146,19 +141,20 @@ async def invite_scenario(test_server, protocol, loop, from_details, to_details,
         headers={'Content-Type': 'application/sdp'},
         payload='v=0\r\n',
     )
-    async for _ in call.wait_for_terminate(timeout=2):
-        pass
-    await asyncio.wait_for(ack_received, timeout=2)
+    responses = list()
+    async for msg in call.wait_for_terminate(timeout=2):
+        responses.append(msg.status_code)
+    await asyncio.wait_for(futures['ACK'], timeout=2)
     await call.close(timeout=2)
     await asyncio.sleep(0.1)
 
     await app.close()
     await server_app.close()
-    return received_messages
+    return received_messages, responses
 
 
 async def test_ack_for_2xx_uses_new_branch(test_server, protocol, loop, from_details, to_details):
-    messages = await invite_scenario(test_server, protocol, loop, from_details, to_details, 200)
+    messages, responses = await invite_scenario(test_server, protocol, loop, from_details, to_details, 200)
     by_method = {m.method: m for m in messages}
     assert {'INVITE', 'ACK', 'BYE'} <= set(by_method)
     invite, ack, bye = by_method['INVITE'], by_method['ACK'], by_method['BYE']
@@ -170,10 +166,12 @@ async def test_ack_for_2xx_uses_new_branch(test_server, protocol, loop, from_det
     assert sent_by_of(ack) == sent_by_of(invite)
     # BYE is another new transaction
     assert branch_of(bye) not in (branch_of(invite), branch_of(ack))
+    # only INVITE responses are passed up; the 200 to our BYE is not
+    assert responses == [200]
 
 
 async def test_ack_for_non_2xx_reuses_invite_branch(test_server, protocol, loop, from_details, to_details):
-    messages = await invite_scenario(test_server, protocol, loop, from_details, to_details, 486)
+    messages, responses = await invite_scenario(test_server, protocol, loop, from_details, to_details, 486)
     by_method = {m.method: m for m in messages}
     assert {'INVITE', 'ACK'} <= set(by_method)
     invite, ack = by_method['INVITE'], by_method['ACK']
@@ -182,3 +180,60 @@ async def test_ack_for_non_2xx_reuses_invite_branch(test_server, protocol, loop,
     assert ack.cseq == invite.cseq
     assert branch_of(ack) == branch_of(invite)
     assert sent_by_of(ack) == sent_by_of(invite)
+    assert responses == [486]
+
+
+async def test_cancel_belongs_to_invite_transaction(test_server, protocol, loop, from_details, to_details):
+    received_messages = list()
+    futures = {'ACK': loop.create_future()}
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=180)
+            async for msg in dialog:
+                if msg.method == 'CANCEL':
+                    # RFC 3261 9.2: 487 to the INVITE, 200 to the CANCEL
+                    await dialog.reply(message, status_code=487)
+                    await dialog.reply(msg, status_code=200)
+                    break
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    record_requests(server_app, received_messages, futures)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+    )
+    ringing = await asyncio.wait_for(call.recv(), timeout=2)
+    assert ringing.status_code == 180
+
+    await call.close(timeout=2)
+    await asyncio.wait_for(futures['ACK'], timeout=2)
+    await asyncio.sleep(0.1)
+
+    by_method = {m.method: m for m in received_messages}
+    assert {'INVITE', 'CANCEL', 'ACK'} <= set(by_method)
+    invite, cancel, ack = by_method['INVITE'], by_method['CANCEL'], by_method['ACK']
+
+    # RFC 3261 9.1: CANCEL matches the INVITE's CSeq number and top Via
+    assert cancel.cseq == invite.cseq
+    assert cancel.headers['Via'] == invite.headers['Via']
+    assert str(cancel.to_details) == str(invite.to_details)
+    # and the ACK for the 487 is part of the INVITE transaction too
+    assert ack.cseq == invite.cseq
+    assert branch_of(ack) == branch_of(invite)
+
+    await app.close()
+    await server_app.close()

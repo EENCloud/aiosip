@@ -3,7 +3,8 @@ import logging
 
 import aiosip
 from aiosip.auth import Auth
-from . import utils
+from multidict import CIMultiDict
+
 from .exceptions import AuthentificationFailed
 
 
@@ -77,19 +78,27 @@ class BaseTransaction:
             username = msg.from_details['uri']['user']
 
         # RFC 3261 sections 8.1.3.5 and 17.1.3: the request re-sent with
-        # credentials is a new transaction, so it needs a new branch. Reusing
-        # the branch makes a compliant UAS match it to the completed 401
-        # transaction and simply retransmit the 401.
-        self.original_msg.cseq += 1
-        self.original_msg.headers['Via'] = utils.replace_branch(self.original_msg.headers['Via'])
-        self.original_msg.headers['Authorization'] = msg.auth.generate_authorization(
+        # credentials is a new transaction. Build it through the dialog so it
+        # gets a fresh CSeq (keeping dialog.cseq in step) and a fresh Via
+        # branch, instead of mutating the request that is already on the wire.
+        previous = self.original_msg
+        headers = CIMultiDict(previous.headers)
+        for name in ('Via', 'CSeq', 'Content-Length', 'Authorization'):
+            headers.popall(name, None)
+        retry = self.dialog._prepare_request(previous.method, headers=headers, payload=previous.payload,
+                                             to_details=previous.to_details)
+        retry.headers['Authorization'] = msg.auth.generate_authorization(
             username=username,
             password=self.dialog.password,
             payload=msg.payload,
             uri=msg.to_details['uri'].short_uri()
         )
 
-        self.dialog.transactions[self.original_msg.method][self.original_msg.cseq] = self
+        # Re-key the transaction: a retransmitted 401 for the old CSeq must not
+        # find us again and trigger another retry.
+        self.dialog.transactions[previous.method].pop(previous.cseq, None)
+        self.original_msg = retry
+        self.dialog.transactions[retry.method][retry.cseq] = self
         self.authentification = asyncio.ensure_future(self._timer())
 
     def _handle_proxy_authenticate(self, msg):
@@ -134,7 +143,7 @@ class FutureTransaction(BaseTransaction):
             self._handle_proxy_authenticate(msg)
             return
         elif self.original_msg.method.upper() == 'INVITE' and msg.status_code == 200:
-            self.dialog.ack(msg)
+            self.dialog.ack(msg, request=self.original_msg)
             self._result(msg)
         elif 100 <= msg.status_code < 200:
             pass
@@ -168,5 +177,5 @@ class UnreliableTransaction(FutureTransaction):
             if type(self.dialog) is aiosip.dialog.InviteDialog:
                 self.loop.run_until_complete(self.dialog.close())
             else:
-                self.dialog.cancel(cseq=self.original_msg.cseq)
+                self.dialog.cancel(request=self.original_msg)
         super().close()

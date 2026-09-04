@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 
+import re
 
 try:
     from setuptools import setup
@@ -9,6 +10,7 @@ except ImportError:
 
 readme = open('README.rst').read()
 history = open('HISTORY.rst').read().replace('.. :changelog:', '')
+version = re.search(r"^__version__ = '([^']+)'", open('aiosip/__init__.py').read(), re.M).group(1)
 
 requirements = [
    'multidict>=2.0',
@@ -25,7 +27,7 @@ test_requirements = [
 
 setup(
     name='aiosip',
-    version='0.2.4',
+    version=version,
     description='SIP support for AsyncIO',
     long_description=readme + '\n\n' + history,
     author='Ludovic Gasc (GMLudo)',

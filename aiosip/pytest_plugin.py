@@ -53,7 +53,8 @@ def setup_test_loop(loop_factory=asyncio.new_event_loop):
     """
     loop = loop_factory()
     asyncio.set_event_loop(loop)
-    if sys.platform != "win32":
+    if sys.platform != "win32" and sys.version_info < (3, 12):
+        # Child watchers are deprecated in 3.12 and removed in 3.14.
         policy = asyncio.get_event_loop_policy()
         watcher = asyncio.SafeChildWatcher()
         watcher.attach_loop(loop)
@@ -124,13 +125,25 @@ def pytest_pyfunc_call(pyfuncitem):
         return True
 
 
-@pytest.fixture(params=LOOP_FACTORIES, ids=LOOP_FACTORY_IDS)
+def pytest_generate_tests(metafunc):
+    """Parametrize the ``loop`` fixture with the loops selected by ``--loop``.
+
+    LOOP_FACTORIES is only filled in pytest_configure, which is too late for a
+    ``params=`` argument on the fixture decorator (evaluated at import time),
+    so the parametrization is applied here, at collection time.
+    """
+    if 'loop' in metafunc.fixturenames:
+        metafunc.parametrize('loop', LOOP_FACTORIES, ids=LOOP_FACTORY_IDS, indirect=True)
+
+
+@pytest.fixture
 def loop(request):
     """Return an instance of the event loop."""
+    loop_factory = getattr(request, 'param', asyncio.new_event_loop)
     fast = request.config.getoption('--fast')
     debug = request.config.getoption('--enable-loop-debug')
 
-    with loop_context(request.param, fast=fast) as _loop:
+    with loop_context(loop_factory, fast=fast) as _loop:
         if debug:
             _loop.set_debug(True)  # pragma: no cover
         yield _loop
