@@ -70,24 +70,50 @@ class Auth(MutableMapping):
         return auth
 
     @classmethod
+    def _parse_first_supported(cls, message, header, parse):
+        """Parse the first value of ``header`` that ``parse`` understands.
+
+        A header may appear more than once, in which case Message collapses the
+        values into a list: RFC 8760 servers offer several Digest algorithms
+        that way. Unsupported schemes are skipped rather than raised so that a
+        challenge this library cannot answer leaves the response to its normal
+        handling instead of breaking the dispatch that is delivering it.
+        """
+        if header not in message.headers:
+            return None
+
+        values = message.headers[header]
+        if not isinstance(values, (list, tuple)):
+            values = [values]
+
+        for value in values:
+            if not isinstance(value, str):
+                continue
+            try:
+                return parse(value, message.method)
+            except ValueError:
+                continue
+        return None
+
+    @classmethod
     def from_message(cls, message, header=None):
         """Parse the challenge or credential carried by ``message``.
+
+        Returns None when there is nothing parseable to answer.
 
         ``header`` names the one to read, for a response that carries both a
         WWW-Authenticate and a Proxy-Authenticate challenge: answering the
         wrong one loops until the attempts run out.
         """
         if header is not None:
-            if header not in message.headers:
-                return None
-            return cls.from_authenticate_header(message.headers[header], message.method)
+            return cls._parse_first_supported(message, header, cls.from_authenticate_header)
 
         if 'Authorization' in message.headers:
-            return cls.from_authorization_header(message.headers['Authorization'], message.method)
+            return cls._parse_first_supported(message, 'Authorization', cls.from_authorization_header)
         elif 'WWW-Authenticate' in message.headers:
-            return cls.from_authenticate_header(message.headers['WWW-Authenticate'], message.method)
+            return cls._parse_first_supported(message, 'WWW-Authenticate', cls.from_authenticate_header)
         elif 'Proxy-Authenticate' in message.headers:
-            return cls.from_authenticate_header(message.headers['Proxy-Authenticate'], message.method)
+            return cls._parse_first_supported(message, 'Proxy-Authenticate', cls.from_authenticate_header)
         else:
             return None
 

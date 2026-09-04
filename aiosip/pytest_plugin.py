@@ -97,7 +97,9 @@ def pytest_configure(config):
         if name in factories:
             selected.append((name, factories[name]))
         elif required:
-            raise ValueError(
+            # A bad --loop value is a user error; ValueError here surfaces as
+            # pytest's INTERNALERROR traceback instead of a usage message.
+            raise pytest.UsageError(
                 "Unknown loop '%s', available loops: %s" % (
                     name, list(factories.keys())))
 
@@ -138,6 +140,12 @@ def pytest_generate_tests(metafunc):
     ``params=`` argument on the fixture decorator (evaluated at import time),
     so the parametrization happens here, at collection time. Tests and
     downstream conftests that parametrize ``loop`` themselves are left alone.
+
+    NOTE: the override detection reads private pytest surfaces
+    (``metafunc._arg2fixturedefs`` and a FixtureDef's ``func``), and the loop
+    selection is read from ``config._aiosip_loops`` stashed by
+    ``pytest_configure``. Verified against pytest 8.2.2 (CPython 3.9) and
+    pytest 9.0.2 (CPython 3.12); re-check these three when bumping pytest.
     """
     if 'loop' not in metafunc.fixturenames:
         return

@@ -2,6 +2,8 @@ import asyncio
 import collections
 import re
 
+from contextlib import suppress
+
 import pytest
 
 import aiosip
@@ -1155,3 +1157,251 @@ def test_close_removes_every_registration_key_without_scanning():
     dialog._unregister()
     assert app._dialogs == {'other': other}
     assert dialog._dialog_keys == set()
+
+
+def make_response(*header_lines):
+    """Build a Response from raw header lines, so header collapsing is real."""
+    lines = ('SIP/2.0 401 Unauthorized',
+             'Via: SIP/2.0/UDP h:5060;branch=z9hG4bKx',
+             'From: <sip:a@h>;tag=f', 'To: <sip:b@h>',
+             'Call-ID: c', 'CSeq: 1 INVITE') + header_lines
+    return aiosip.message.Response.from_raw_headers('\r\n'.join(lines).encode())
+
+
+def test_auth_from_message_skips_unsupported_scheme():
+    """A non-Digest challenge yields None rather than raising."""
+    msg = make_response('WWW-Authenticate: Basic realm="r"')
+    assert msg.auth is None
+    assert aiosip.auth.Auth.from_message(msg, header='WWW-Authenticate') is None
+
+
+def test_auth_from_message_handles_a_repeated_header():
+    """RFC 8760 servers offer several Digest algorithms as repeated headers."""
+    msg = make_response(
+        'WWW-Authenticate: Digest realm="sha", nonce="n1", algorithm=SHA-256',
+        'WWW-Authenticate: Digest realm="md5", nonce="n2", algorithm=MD5',
+    )
+    # collapsed into a list by the parser, which used to raise AttributeError
+    assert isinstance(msg.headers['WWW-Authenticate'], list)
+    auth = msg.auth
+    assert auth is not None
+    assert auth['nonce'] == 'n1'
+    assert aiosip.auth.Auth.from_message(msg, header='WWW-Authenticate')['nonce'] == 'n1'
+
+
+def test_auth_from_message_skips_to_the_first_supported_value():
+    """An unsupported first value does not hide a usable second one."""
+    msg = make_response(
+        'WWW-Authenticate: Basic realm="r"',
+        'WWW-Authenticate: Digest realm="d", nonce="n2", algorithm=MD5',
+    )
+    auth = msg.auth
+    assert auth is not None
+    assert auth['nonce'] == 'n2'
+
+
+async def test_unparseable_challenge_still_fails_the_call(test_server, protocol, loop, from_details, to_details):
+    """A challenge this library cannot answer must not strand the dialog.
+
+    The 401 guard evaluates msg.auth before the state machine runs, so a
+    raising parse left _waiter pending forever and ready() hung.
+    """
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.invite
+
+        async def invite(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, status_code=401,
+                               headers={'WWW-Authenticate': 'Basic realm="r"'})
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    call = await peer.invite(
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        password='abcdefg',
+    )
+    with pytest.raises(RuntimeError, match='401'):
+        await asyncio.wait_for(call.ready(), timeout=5)
+    assert call.state is aiosip.dialog.CallState.Completed
+
+    await app.close()
+    await server_app.close()
+
+
+async def test_in_dialog_auth_retry_keeps_the_remote_tag(test_server, protocol, loop, from_details, to_details):
+    """RFC 3261 8.2.6.2 allows a new To tag only for a dialog-establishing
+    request, so an in-dialog challenge must not clear the learned tag.
+
+    The retry here is never answered, which is the case where nothing restores
+    the tag afterwards: every later in-dialog request would go out tagless and
+    a compliant UAS answers 481.
+    """
+    password = 'abcdefg'
+    challenged = loop.create_future()
+
+    class Dialplan(aiosip.BaseDialplan):
+
+        async def resolve(self, *args, **kwargs):
+            await super().resolve(*args, **kwargs)
+            return self.subscribe
+
+        async def subscribe(self, request, message):
+            dialog = request._create_dialog()
+            await dialog.reply(message, 200)
+            async for message in dialog:
+                if 'Authorization' in message.headers:
+                    # the authenticated retry is dropped on the floor
+                    if not challenged.done():
+                        challenged.set_result(None)
+                    continue
+                await dialog.unauthorized(message)
+
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop, dialplan=Dialplan())
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    dialog = await asyncio.wait_for(peer.subscribe(
+        expires=1800,
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        password=password,
+    ), timeout=5)
+
+    established_tag = dialog.to_details['params']['tag']
+    assert established_tag  # learned from the 200
+
+    refresh = loop.create_task(dialog.refresh())
+    await asyncio.wait_for(challenged, timeout=5)
+    await asyncio.sleep(0.1)
+
+    # the remote tag of an established dialog survives the challenge
+    assert dialog.to_details['params'].get('tag') == established_tag
+    assert app._dialogs.get(dialog.dialog_id) is dialog
+
+    refresh.cancel()
+    with suppress(asyncio.CancelledError):
+        await refresh
+
+    await app.close()
+    await server_app.close()
+
+
+def test_ack_cache_is_per_2xx_not_per_cseq():
+    """A forked INVITE yields several 2xx sharing a CSeq; each needs its own ACK."""
+    sent = list()
+    invite = type('M', (), {'cseq': 1, 'method': 'INVITE',
+                            'headers': {'Via': 'SIP/2.0/UDP h:5060;branch=z9hG4bKinv'},
+                            'to_details': None})()
+
+    dialog = aiosip.dialog.Dialog.__new__(aiosip.dialog.Dialog)
+    dialog._acks = {}
+    dialog.original_msg = invite
+    dialog.peer = type('P', (), {'send_message': lambda self, msg: sent.append(msg)})()
+
+    def prepare(method, contact_details=None, headers=None, payload=None, cseq=None, to_details=None):
+        return {'method': method, 'cseq': cseq, 'to': to_details, 'headers': headers}
+
+    dialog._prepare_request = prepare
+
+    def response(tag):
+        return type('R', (), {'status_code': 200, 'cseq': 1,
+                              'to_details': {'params': {'tag': tag}}})()
+
+    first, second = response('T1'), response('T2')
+    dialog.ack(first)
+    dialog.ack(second)
+    # a distinct ACK per callee, not the first one replayed
+    assert len(sent) == 2
+    assert sent[0]['to']['params']['tag'] == 'T1'
+    assert sent[1]['to']['params']['tag'] == 'T2'
+    # and a retransmitted 2xx replays that callee's own ACK
+    dialog.ack(response('T1'))
+    assert len(sent) == 3
+    assert sent[2] is sent[0]
+
+
+def test_ack_cache_is_bounded():
+    sent = list()
+    invite = type('M', (), {'cseq': 1, 'method': 'INVITE',
+                            'headers': {'Via': 'SIP/2.0/UDP h:5060;branch=z9hG4bKinv'},
+                            'to_details': None})()
+    dialog = aiosip.dialog.Dialog.__new__(aiosip.dialog.Dialog)
+    dialog._acks = {}
+    dialog.original_msg = invite
+    dialog.peer = type('P', (), {'send_message': lambda self, msg: sent.append(msg)})()
+    dialog._prepare_request = lambda method, **kw: {'method': method, **kw}
+
+    for i in range(aiosip.dialog.MAX_CACHED_ACKS * 3):
+        dialog.ack(type('R', (), {'status_code': 200, 'cseq': i,
+                                  'to_details': {'params': {'tag': 't'}}})())
+    assert len(dialog._acks) <= aiosip.dialog.MAX_CACHED_ACKS
+
+
+def test_cancel_rejects_to_details_for_an_invite():
+    """Both cancel() branches take the same arguments; the INVITE path says why
+    it cannot honour to_details instead of raising a signature TypeError."""
+    sent = list()
+    invite = type('M', (), {'cseq': 4, 'method': 'INVITE',
+                            'headers': {'Via': 'SIP/2.0/UDP h:5060;branch=z9hG4bKinv',
+                                        'To': '<sip:a@h>'},
+                            'to_details': None})()
+    dialog = aiosip.dialog.Dialog.__new__(aiosip.dialog.Dialog)
+    dialog.transactions = {'INVITE': {4: type('T', (), {'original_msg': invite})()}}
+    dialog.cseq = 4
+    dialog.peer = type('P', (), {'send_message': lambda self, msg: sent.append(msg)})()
+    dialog._prepare_request = lambda method, **kw: {'method': method, **kw}
+
+    with pytest.raises(TypeError, match='9.1'):
+        dialog.cancel(to_details=aiosip.Contact.from_header('sip:elsewhere@h'), request=invite)
+    # the same keyword is accepted where RFC 3261 9.1 does not constrain it
+    subscribe = type('M', (), {'cseq': 4, 'method': 'SUBSCRIBE', 'headers': {}, 'to_details': None})()
+    dialog.cancel(to_details=aiosip.Contact.from_header('sip:elsewhere@h'), request=subscribe)
+    assert sent[-1]['method'] == 'CANCEL'
+
+
+async def test_cancel_builds_a_real_message(test_server, protocol, loop, from_details, to_details):
+    """Exercise the INVITE cancel path through the real _prepare_request, not a
+    stub, so the built CANCEL is a message that actually encodes."""
+    app = aiosip.Application(loop=loop)
+    server_app = aiosip.Application(loop=loop)
+    server = await test_server(server_app)
+
+    peer = await app.connect(
+        protocol=protocol,
+        remote_addr=(server.sip_config['server_host'], server.sip_config['server_port'])
+    )
+    dialog = peer._create_dialog(
+        method='INVITE',
+        from_details=aiosip.Contact.from_header(from_details),
+        to_details=aiosip.Contact.from_header(to_details),
+        dialog_factory=aiosip.dialog.Dialog,
+    )
+    invite = dialog._prepare_request('INVITE')
+    invite.encode()  # freezes the To header, as sending does
+
+    cancel = dialog._prepare_cancel(invite, headers={'X-Custom': 'kept'})
+    raw = cancel.encode().decode()
+
+    assert raw.startswith('CANCEL ')
+    # RFC 3261 9.1: same CSeq number and top Via as the INVITE
+    assert 'CSeq: {} CANCEL'.format(invite.cseq) in raw
+    assert branch_of(cancel) == branch_of(invite)
+    assert 'X-Custom: kept' in raw
+
+    await app.close()
+    await server_app.close()

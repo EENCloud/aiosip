@@ -21,6 +21,10 @@ LOG = logging.getLogger(__name__)
 # a CANCEL has been answered, when the caller gave no timeout of its own.
 CANCEL_FINAL_RESPONSE_TIMEOUT = 5
 
+# How many 2xx ACKs a dialog keeps for retransmission. One per forked callee is
+# enough; the bound stops a long-lived dialog from growing an entry per 2xx.
+MAX_CACHED_ACKS = 16
+
 
 class CallState(enum.Enum):
     Calling = enum.auto()
@@ -60,8 +64,9 @@ class DialogBase:
         # changes as tags are learned and Peer._create_dialog adds a tagless
         # fallback, so the keys are remembered rather than searched for.
         self._dialog_keys = set()
-        # ACKs sent for a 2xx, by CSeq: a retransmitted 2xx is answered with
-        # the same ACK (RFC 3261 section 13.2.2.4), not a new transaction.
+        # ACKs sent for a 2xx, keyed by (CSeq, remote tag): a retransmitted 2xx
+        # is answered with the same ACK (RFC 3261 section 13.2.2.4), while a
+        # forked INVITE yields one 2xx per callee, each needing its own.
         self._acks = {}
 
         # TODO: Needs to be last because we need the above attributes set
@@ -157,7 +162,10 @@ class DialogBase:
         if request is None:
             request = self.original_msg
 
-        cached = self._acks.get(msg.cseq)
+        # A forked INVITE is answered by several 2xx that share a CSeq and
+        # differ only in the To tag, and each needs its own ACK.
+        ack_key = (msg.cseq, msg.to_details['params'].get('tag'))
+        cached = self._acks.get(ack_key)
         if cached is not None:
             # Retransmitted 2xx: one client transaction retransmitting its ACK.
             self.peer.send_message(cached)
@@ -175,7 +183,9 @@ class DialogBase:
 
         ack = self._prepare_request('ACK', cseq=msg.cseq, to_details=msg.to_details, headers=headers)
         if msg.status_code < 300:
-            self._acks[msg.cseq] = ack
+            self._acks[ack_key] = ack
+            while len(self._acks) > MAX_CACHED_ACKS:
+                del self._acks[next(iter(self._acks))]
         self.peer.send_message(ack)
 
     def _prepare_cancel(self, request, contact_details=None, headers=None, payload=None):
@@ -436,29 +446,38 @@ class Dialog(DialogBase):
             return pending[max(pending)].original_msg
         return None
 
-    def cancel(self, *args, request=None, **kwargs):
+    def cancel(self, contact_details=None, headers=None, payload=None, cseq=None, to_details=None, *,
+               request=None):
         """Send a CANCEL for ``request``, or for the pending INVITE.
 
-        ``cseq=`` selects which pending INVITE to cancel. The dialog's initial
-        request is a template that is never sent, so it is not used as a
-        fallback. Without any pending INVITE the previous behaviour of
-        building a plain CANCEL from the arguments is kept.
+        The argument list mirrors ``_prepare_request`` so that the call means
+        the same thing whichever path it takes. ``cseq`` selects which pending
+        INVITE to cancel; the dialog's initial request is a template that is
+        never sent, so it is not used as a fallback.
+
+        RFC 3261 section 9.1 fixes a CANCEL's To and CSeq to those of the
+        request being cancelled, so ``to_details`` is rejected rather than
+        silently ignored when an INVITE is being cancelled.
         """
         if request is None:
-            # cseq stays in kwargs: the fallback below still needs it to build
-            # a CANCEL with the CSeq the caller asked for.
-            request = self._pending_invite(kwargs.get('cseq'))
+            request = self._pending_invite(cseq)
 
         if request is not None and request.method == 'INVITE':
-            kwargs.pop('cseq', None)  # taken from the request being cancelled
-            cancel = self._prepare_cancel(request, *args, **kwargs)
+            if to_details is not None:
+                raise TypeError(
+                    'to_details cannot be set when cancelling an INVITE: RFC 3261 section 9.1 '
+                    'requires the CANCEL to carry the To of the request being cancelled'
+                )
+            cancel = self._prepare_cancel(request, contact_details=contact_details, headers=headers,
+                                          payload=payload)
         else:
             # RFC 3261 section 9.1 restricts CANCEL to INVITE. For anything
             # else keep the previous behaviour: a CANCEL of its own, with a
             # fresh branch, so it is not matched to the live transaction.
-            if request is not None:
-                kwargs.setdefault('cseq', request.cseq)
-            cancel = self._prepare_request('CANCEL', *args, **kwargs)
+            if request is not None and cseq is None:
+                cseq = request.cseq
+            cancel = self._prepare_request('CANCEL', contact_details=contact_details, headers=headers,
+                                           payload=payload, cseq=cseq, to_details=to_details)
         self.peer.send_message(cancel)
 
     async def recv(self):

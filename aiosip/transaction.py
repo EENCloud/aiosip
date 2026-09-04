@@ -54,13 +54,22 @@ class BaseTransaction:
         if self.retransmission:
             self.retransmission.cancel()
             self.retransmission = None
+        # _handle_authenticate replaces the retransmission timer with this one;
+        # leaving it running would keep re-sending the authenticated request for
+        # ~63s against a dialog the application has already torn down.
+        if self.authentification:
+            self.authentification.cancel()
+            self.authentification = None
 
     async def _timer(self, timeout=0.5):
         max_timeout = timeout * 64
-        while timeout <= max_timeout:
+        while self._running and timeout <= max_timeout:
             self.dialog.peer.send_message(self.original_msg)
             await asyncio.sleep(timeout)
             timeout *= 2
+
+        if not self._running:
+            return
 
         self._error(asyncio.TimeoutError('SIP timer expired for {cseq}, {method}, {call_id}'.format(
             cseq=self.original_msg.cseq,
@@ -124,15 +133,22 @@ class BaseTransaction:
         self.original_msg = retry
         self.dialog.transactions[retry.method][retry.cseq] = self
 
-        # The retry goes out with an untagged To, and RFC 3261 8.2.6.2 lets the
-        # UAS pick a fresh tag for it. The dialog is registered under the tag
-        # learned from the challenge, and its tagless fallback key was dropped
-        # when that tag was learned, so a new tag would match neither. Forget
-        # the challenge's tag and re-register so the fallback matches again.
-        dialog = self.dialog
-        dialog._unregister(dialog.dialog_id)
-        dialog.to_details['params'].pop('tag', None)
-        dialog._register()
+        # RFC 3261 8.2.6.2 lets the UAS pick a fresh To tag, but only for a
+        # request that establishes the dialog. When the challenged request went
+        # out untagged, the dialog is registered under the tag learned from the
+        # challenge and its tagless fallback key was dropped when that tag was
+        # learned, so a new tag would match neither: forget the challenge's tag
+        # and re-register so the fallback matches again.
+        #
+        # For an in-dialog request (a BYE, a SUBSCRIBE/REGISTER refresh, a
+        # re-INVITE) the remote tag is fixed for the life of the dialog and is
+        # left alone; dropping it would strand the dialog and send every later
+        # in-dialog request with a tagless To.
+        if 'tag' not in to_details['params']:
+            dialog = self.dialog
+            dialog._unregister(dialog.dialog_id)
+            dialog.to_details['params'].pop('tag', None)
+            dialog._register()
 
         self.authentification = asyncio.ensure_future(self._timer())
 

@@ -25,7 +25,12 @@ History
   and ``_handle_proxy_authenticate`` answers with Proxy-Authorization instead
   of recursing into itself. Stale credentials are not copied into a retry.
 * A retransmitted 2xx is answered by retransmitting the same ACK rather than
-  building a new one with a fresh branch.
+  building a new one with a fresh branch. The cache is keyed per 2xx (CSeq
+  plus remote tag) so a forked INVITE gets one ACK per callee, and bounded.
+* An unparseable or unsupported challenge makes ``Message.auth`` None instead
+  of raising out of the dispatch task, and a header repeated for several
+  Digest algorithms (RFC 8760) is answered from its first supported value.
+* Closing a transaction cancels its authentication retransmission timer.
 * ``close()`` bounds its wait for the 487 after a CANCEL and never raises
   because that response is missing.
 * Closing a dialog removes every key it is registered under, not just the
@@ -46,7 +51,13 @@ History
   retry keeps the To header of the request as it was sent.
 * ``aiosip.pytest_plugin`` fails with a usage error when ``--loop`` selects
   no loop, and leaves a ``loop`` fixture parametrized downstream alone.
-* Removed the unused ``Peer.generate_via_headers``.
+* Backwards-incompatible API changes (small, but note them when upgrading):
+  the unused ``Peer.generate_via_headers`` is removed; ``DialogBase.ack()``
+  takes responses only and its ``request`` argument is keyword-only; and
+  ``Dialog.cancel()`` has an explicit signature mirroring
+  ``_prepare_request`` instead of ``*args, **kwargs``, rejecting
+  ``to_details`` when an INVITE is being cancelled because RFC 3261
+  section 9.1 fixes the CANCEL's To to that of the cancelled request.
 * Package version now comes from ``aiosip.__version__`` (also used in the
   default User-Agent).
 * Test suite runs again on current pytest/Python: fixed the ``loop`` fixture
