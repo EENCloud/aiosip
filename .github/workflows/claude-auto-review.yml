@@ -15,7 +15,7 @@ jobs:
   claude-review:
     # Dependabot PRs can't access org secrets, so the Vault step would
     # fail at credential-import. Skip them at the workflow level.
-    if: github.actor != 'dependabot[bot]'
+    if: github.event.pull_request.user.login != 'dependabot[bot]'
     # Explicit minimum permissions — the reusable workflow needs to post
     # the review comment and (where applicable) react to PR events. Set
     # at the caller layer so the workflow works regardless of the target
@@ -23,7 +23,7 @@ jobs:
     permissions:
       contents: read
       pull-requests: write
-      issues: write
+      issues: read
       id-token: write
     # Intentionally pinned to @main: every enrolled repo picks up
     # workflow-library updates centrally. Trade-off accepted — a
